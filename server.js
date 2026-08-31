@@ -343,6 +343,37 @@ function pushScanProgress(data) {
   });
 }
 
+// ============ AI 思考过程 SSE ============
+
+let aiThinkingClients = [];
+
+app.get('/api/v1/ai-thinking-stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  aiThinkingClients.push(res);
+
+  res.write('data: {"type":"init","message":"AI 思考服务已连接"}\n\n');
+
+  req.on('close', () => {
+    aiThinkingClients = aiThinkingClients.filter(client => client !== res);
+    console.log('[AI SSE] 客户端断开连接');
+  });
+});
+
+function pushAiThinking(data) {
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+  aiThinkingClients.forEach(client => {
+    try {
+      client.write(message);
+    } catch (err) {
+      console.error('[AI SSE] 推送失败:', err.message);
+    }
+  });
+}
+
 // 执行完整的采集任务（v2: 三级匹配 + 可信度）
 app.post('/api/v1/collect', (req, res) => {
   try {
@@ -594,8 +625,31 @@ app.post('/api/v1/ai/autofill', async (req, res) => {
       return res.status(400).json({ success: false, error: '缺少必要参数: indicators' });
     }
 
+    // 推送开始思考
+    pushAiThinking({
+      type: 'start',
+      message: `开始分析 ${indicators.length} 个指标`,
+      vendor: vendor || '医疗',
+      deviceType: deviceType || '设备'
+    });
+
     const rules = [];
-    for (const indicator of indicators) {
+    for (let i = 0; i < indicators.length; i++) {
+      const indicator = indicators[i];
+
+      // 推送正在分析指标
+      pushAiThinking({
+        type: 'analyzing',
+        indicator: indicator,
+        progress: `${i + 1}/${indicators.length}`
+      });
+
+      // 推送搜索经验库
+      pushAiThinking({
+        type: 'thinking',
+        message: '搜索经验库...'
+      });
+
       const prompt = `你是${vendor || '医疗'}${deviceType || '设备'}日志分析专家。
 请为以下指标生成采集关键词：
 
@@ -610,6 +664,12 @@ app.post('/api/v1/ai/autofill', async (req, res) => {
 
 如果不确定，filePattern填""，keyword填""，synonyms填[]。`;
 
+      // 推送调用 AI
+      pushAiThinking({
+        type: 'thinking',
+        message: `调用 AI 模型分析关键字...`
+      });
+
       // 使用传入的模型和后端，如果没有则使用默认
       const aiResult = await callAI(prompt, { timeout: 30000, model: model || undefined, backend: backend || 'ollama' });
 
@@ -618,13 +678,31 @@ app.post('/api/v1/ai/autofill', async (req, res) => {
         const jsonMatch = aiResult.content.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           parsed = JSON.parse(jsonMatch[0]);
+          // 推送解析成功
+          pushAiThinking({
+            type: 'success',
+            indicator: indicator,
+            keyword: parsed?.keyword || '',
+            synonyms: parsed?.synonyms || [],
+            filePattern: parsed?.filePattern || ''
+          });
         } else {
           console.log('AI 返回内容:', aiResult.content);
+          pushAiThinking({
+            type: 'warning',
+            indicator: indicator,
+            message: 'AI 返回格式异常'
+          });
         }
       } catch (e) {
         // AI 返回解析失败，记录日志
         console.error('AI 返回解析失败:', e.message);
         console.error('AI 原始响应:', aiResult.content?.substring(0, 500));
+        pushAiThinking({
+          type: 'error',
+          indicator: indicator,
+          message: '解析失败：' + e.message
+        });
       }
 
       rules.push({
@@ -634,6 +712,12 @@ app.post('/api/v1/ai/autofill', async (req, res) => {
         synonyms: parsed?.synonyms || []
       });
     }
+
+    // 推送完成
+    pushAiThinking({
+      type: 'complete',
+      message: `补全完成！共处理 ${rules.length} 个指标`
+    });
 
     res.json({ success: true, rules });
   } catch (err) {

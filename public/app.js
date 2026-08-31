@@ -388,18 +388,37 @@ async function startCollection() {
   let matchedFileCount = 0;
 
   try {
+    // 等待 SSE 连接建立后再开始采集
     scanEventSource = new EventSource('/api/v1/scan-stream');
+    
+    // 使用 Promise 等待连接建立
+    await new Promise((resolve, reject) => {
+      scanEventSource.onopen = () => {
+        console.log('[SSE] 连接已建立');
+        $('#scanStatusText').textContent = '已连接';
+        resolve();
+      };
+      
+      scanEventSource.onerror = (err) => {
+        console.error('[SSE] 连接错误:', err);
+        $('#scanStatusText').textContent = '连接失败';
+        reject(new Error('SSE 连接失败'));
+      };
+      
+      // 超时处理
+      setTimeout(() => {
+        reject(new Error('SSE 连接超时'));
+      }, 5000);
+    });
     
     scanEventSource.onmessage = (event) => {
       const data = JSON.parse(event.data);
       
-      if (data.type === 'init') {
-        $('#scanStatusText').textContent = '已连接';
-      } else if (data.type === 'start') {
+      if (data.type === 'start') {
         $('#scanStatusText').textContent = '扫描中...';
       } else if (data.type === 'rule_start') {
         $('#scanCurrentIndicator').textContent = data.indicator;
-        addScanFileEntry('🔍', `开始扫描指标：${data.indicator}`, 'scanning');
+        addScanFileEntry('', `开始扫描指标：${data.indicator}`, 'scanning');
       } else if (data.type === 'file_scanned') {
         scannedFileCount++;
         $('#scanFileCount').textContent = scannedFileCount;
@@ -414,13 +433,8 @@ async function startCollection() {
         addScanFileEntry('✔️', `指标 ${data.indicator} 完成，找到 ${data.filesFound} 个文件`, 'complete');
       } else if (data.type === 'scan_complete') {
         $('#scanStatusText').textContent = '扫描完成';
-        addScanFileEntry('🎉', `扫描完成！共扫描 ${data.totalFiles} 个文件`, 'complete');
+        addScanFileEntry('', `扫描完成！共扫描 ${data.totalFiles} 个文件`, 'complete');
       }
-    };
-
-    scanEventSource.onerror = (err) => {
-      console.error('SSE 错误:', err);
-      $('#scanStatusText').textContent = '连接断开';
     };
 
     const res = await fetch('/api/v1/collect', {
@@ -483,6 +497,25 @@ function addScanFileEntry(icon, text, type, indicator = '') {
   
   // 自动滚动到底部
   fileList.scrollTop = fileList.scrollHeight;
+}
+
+// 添加 AI 思考过程条目
+function addAiThinkingEntry(icon, text, type) {
+  const list = $('#aiThinkingList');
+  if (!list) return;
+
+  const entry = document.createElement('div');
+  entry.className = `ai-thinking-entry ai-thinking-${type}`;
+  
+  entry.innerHTML = `
+    <span class="ai-thinking-icon">${icon}</span>
+    <span class="ai-thinking-text">${text}</span>
+  `;
+  
+  list.appendChild(entry);
+  
+  // 自动滚动到底部
+  list.scrollTop = list.scrollHeight;
 }
 
 function renderResults(results, scanLog) {
@@ -796,7 +829,61 @@ async function aiAutoFill() {
   const btnStartCollect = $('#btnStartCollect');
   if (btnStartCollect) btnStartCollect.disabled = true;
 
+  // 显示 AI 思考过程面板
+  const aiThinkingPanel = $('#panel-ai-thinking');
+  if (aiThinkingPanel) {
+    aiThinkingPanel.style.display = 'block';
+    $('#aiThinkingList').innerHTML = '';
+    $('#aiThinkingStatus').textContent = '连接中...';
+  }
+
+  // 连接 AI 思考过程 SSE
+  let aiThinkingEventSource = null;
+
   try {
+    // 等待 SSE 连接建立
+    aiThinkingEventSource = new EventSource('/api/v1/ai-thinking-stream');
+    
+    await new Promise((resolve, reject) => {
+      aiThinkingEventSource.onopen = () => {
+        console.log('[AI SSE] 连接已建立');
+        $('#aiThinkingStatus').textContent = '已连接';
+        resolve();
+      };
+      
+      aiThinkingEventSource.onerror = (err) => {
+        console.error('[AI SSE] 连接错误:', err);
+        $('#aiThinkingStatus').textContent = '连接失败';
+        reject(new Error('AI SSE 连接失败'));
+      };
+      
+      setTimeout(() => {
+        reject(new Error('AI SSE 连接超时'));
+      }, 5000);
+    });
+
+    aiThinkingEventSource.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      
+      if (data.type === 'start') {
+        $('#aiThinkingStatus').textContent = '思考中...';
+        addAiThinkingEntry('🤖', `开始分析 ${data.message}`, 'info');
+      } else if (data.type === 'analyzing') {
+        addAiThinkingEntry('', `分析指标：${data.indicator} (${data.progress})`, 'thinking');
+      } else if (data.type === 'thinking') {
+        addAiThinkingEntry('💭', data.message, 'thinking');
+      } else if (data.type === 'success') {
+        addAiThinkingEntry('✅', `指标 ${data.indicator}: 关键字="${data.keyword}", 备用=[${(data.synonyms || []).join(', ')}]`, 'success');
+      } else if (data.type === 'warning') {
+        addAiThinkingEntry('⚠️', `指标 ${data.indicator}: ${data.message}`, 'info');
+      } else if (data.type === 'error') {
+        addAiThinkingEntry('❌', `指标 ${data.indicator}: ${data.message}`, 'error');
+      } else if (data.type === 'complete') {
+        $('#aiThinkingStatus').textContent = '已完成';
+        addAiThinkingEntry('🎉', data.message, 'success');
+      }
+    };
+
     // 先尝试从经验库匹配
     const expRes = await fetch(`/api/v1/experience/match?vendor=${vendor}&deviceType=${deviceType}`);
     const expData = await expRes.json();
@@ -860,6 +947,11 @@ async function aiAutoFill() {
   } catch (e) {
     showToast('AI 补全失败: ' + e.message, 'error');
   } finally {
+    // 关闭 AI SSE 连接
+    if (aiThinkingEventSource) {
+      aiThinkingEventSource.close();
+    }
+
     state.aiLoading = false;
     if (btn) {
       btn.disabled = false;
