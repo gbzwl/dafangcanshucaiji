@@ -1,0 +1,33 @@
+# 依赖目录
+node_modules/
+pnpm-lock.yaml
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+experience.db
+index.db
+
+# 日志文件
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 构建输出
+dist/
+build/
+
+# 环境变量
+.env
+.env.local
+
+# IDE 配置
+.vscode/
+.idea/
+
+# 临时文件
+*.tmp
+*.temp

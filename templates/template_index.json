@@ -1,0 +1,25 @@
+{
+  "devices": [
+    {
+      "id": "siemens_essenza",
+      "brand": "Siemens",
+      "model": "Essenza",
+      "template": "Siemens_Essenza.xlsx",
+      "description": "Siemens MAGNETOM Essenza 1.5T"
+    },
+    {
+      "id": "siemens_avanto",
+      "brand": "Siemens",
+      "model": "Avanto",
+      "template": "Siemens_Avanto.xlsx",
+      "description": "Siemens MAGNETOM Avanto 1.5T"
+    },
+    {
+      "id": "siemens_skyra",
+      "brand": "Siemens",
+      "model": "Skyra",
+      "template": "Siemens_Skyra.xlsx",
+      "description": "Siemens MAGNETOM Skyra 3.0T"
+    }
+  ]
+}

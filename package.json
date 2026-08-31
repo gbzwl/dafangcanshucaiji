@@ -1,0 +1,58 @@
+{
+  "name": "mri-collector",
+  "version": "1.0.0",
+  "description": "MRI设备日志参数自动采集工具",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "start": "electron .",
+    "dev": "node server.js",
+    "build": "electron-builder --win",
+    "build:dir": "electron-builder --win --dir"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "iconv-lite": "^0.6.3",
+    "multer": "^1.4.5-lts.1",
+    "sql.js": "^1.14.1",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.mri.collector",
+    "productName": "MRICollector",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "MRI采集工具"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "server.js",
+      "core/**/*",
+      "public/**/*",
+      "assets/**/*",
+      "node_modules/**/*"
+    ]
+  }
+}

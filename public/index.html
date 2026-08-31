@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>大放设备参数采集程序</title>
+  <link rel="stylesheet" href="style.css?v=3.1">
+</head>
+<body>
+  <div class="app-container">
+    <!-- 顶部标题栏 -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-icon">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+          </svg>
+        </div>
+        <div>
+          <h1>大放设备参数采集程序</h1>
+          <span class="version">v3.0</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <button class="btn btn-sm btn-secondary" onclick="toggleExperiencePanel()" style="margin-right:12px;">📚 经验库</button>
+        <span class="platform-badge" id="platformBadge">Windows</span>
+      </div>
+    </header>
+
+    <!-- 主内容区 -->
+    <main class="main-content">
+      <!-- 步骤指示器 -->
+      <div class="steps-bar">
+        <div class="step active" data-step="1">
+          <div class="step-number">1</div>
+          <span>选择磁盘</span>
+        </div>
+        <div class="step-line"></div>
+        <div class="step" data-step="2">
+          <div class="step-number">2</div>
+          <span>选择模板</span>
+        </div>
+        <div class="step-line"></div>
+        <div class="step" data-step="3">
+          <div class="step-number">3</div>
+          <span>执行采集</span>
+        </div>
+        <div class="step-line"></div>
+        <div class="step" data-step="4">
+          <div class="step-number">4</div>
+          <span>查看结果</span>
+        </div>
+      </div>
+
+      <!-- 面板1: 磁盘选择 -->
+      <section class="panel" id="panel-disk">
+        <div class="panel-header">
+          <h2>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+              <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+              <line x1="6" y1="6" x2="6.01" y2="6"/>
+              <line x1="6" y1="18" x2="6.01" y2="18"/>
+            </svg>
+            选择目标磁盘
+          </h2>
+          <div class="header-actions">
+            <button class="btn btn-sm btn-outline" id="btnBuildIndex" disabled title="构建文件索引以加速后续扫描">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+              </svg>
+              构建索引
+            </button>
+            <button class="btn btn-sm btn-outline" id="btnRefreshDisks">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="23 4 23 10 17 10"/>
+                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+              </svg>
+              刷新
+            </button>
+          </div>
+        </div>
+        <div class="disk-list" id="diskList">
+          <div class="loading-placeholder">正在检测磁盘...</div>
+        </div>
+        <div class="index-status" id="indexStatus" style="display:none;">
+          <span class="index-icon">&#128218;</span>
+          <span id="indexStatusText">索引状态: 未构建</span>
+        </div>
+      </section>
+
+      <!-- 面板2: 模板选择 -->
+      <section class="panel" id="panel-template">
+        <div class="panel-header">
+          <h2>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="16" y1="13" x2="8" y2="13"/>
+              <line x1="16" y1="17" x2="8" y2="17"/>
+            </svg>
+            选择采集模板
+          </h2>
+          <button class="btn btn-sm btn-outline" id="btnDownloadExample">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            下载模板示例
+          </button>
+        </div>
+
+        <!-- 厂商+设备类型选择 -->
+        <div class="device-selector" id="deviceSelector">
+          <label class="selector-label">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+              <line x1="8" y1="21" x2="16" y2="21"/>
+              <line x1="12" y1="17" x2="12" y2="21"/>
+            </svg>
+            厂商 + 设备类型:
+          </label>
+          <div class="selector-row">
+            <input class="device-select" id="vendorInput" placeholder="输入厂商名称" style="flex:1;">
+            <input class="device-select" id="deviceTypeInput" placeholder="输入设备类型" style="flex:1;">
+            <input class="device-select" id="deviceModelInput" placeholder="型号（可选）" style="flex:1;">
+          </div>
+        </div>
+
+        <!-- 经验库加载 -->
+        <div class="experience-bar" id="experienceBar" style="display:none;">
+          <span class="experience-icon">&#128218;</span>
+          <span id="experienceText">找到 0 条历史记录</span>
+          <button class="btn btn-sm btn-outline" id="btnLoadExperience">加载经验</button>
+        </div>
+
+        <!-- 上传区域 -->
+        <div class="upload-zone" id="uploadZone">
+          <div class="upload-icon">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+          </div>
+          <p class="upload-text">拖拽 Excel 文件到此处，或 <span class="upload-link">点击选择文件</span></p>
+          <p class="upload-hint">支持 .xlsx / .xls 格式，至少包含"指标名称"列</p>
+          <input type="file" id="fileInput" accept=".xlsx,.xls" hidden>
+        </div>
+
+        <!-- 模板预览表格 -->
+        <div class="template-preview" id="templatePreview" style="display:none;">
+          <div class="preview-header">
+            <h3>模板规则预览 <small style="color:#888;font-weight:normal;font-size:12px;">（可直接编辑）</small></h3>
+            <div class="preview-actions">
+              <button class="btn btn-sm btn-secondary" id="btnAddRule" title="添加一行">+ 添加行</button>
+              <button class="btn btn-sm btn-ai" id="btnAiFill">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/>
+                </svg>
+                AI 智能补全
+              </button>
+              <span class="rule-count" id="ruleCount">0 条规则</span>
+            </div>
+          </div>
+          <div class="table-wrapper">
+            <table class="data-table" id="templateTable">
+              <thead>
+                <tr>
+                  <th width="30">#</th>
+                  <th>指标名称</th>
+                  <th>参考文件</th>
+                  <th>关键字</th>
+                  <th>备用关键字</th>
+                  <th width="50">操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 面板3: 执行采集 -->
+      <section class="panel" id="panel-collect">
+        <div class="panel-header">
+          <h2>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <polyline points="12 6 12 12 16 14"/>
+            </svg>
+            执行采集
+          </h2>
+        </div>
+        <div class="collect-info" id="collectInfo">
+          <div class="info-row">
+            <span class="info-label">目标磁盘:</span>
+            <span class="info-value" id="infoDisk">未选择</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">采集规则:</span>
+            <span class="info-value" id="infoRules">未上传模板</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">匹配模式:</span>
+            <span class="info-value">三级匹配（精确 / 模糊 / 同义词）</span>
+          </div>
+        </div>
+        <div class="action-bar">
+          <button class="btn btn-primary btn-lg" id="btnStartCollect" disabled>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="5 3 19 12 5 21 5 3"/>
+            </svg>
+            开始采集
+          </button>
+        </div>
+
+        <!-- 进度条 -->
+        <div class="progress-section" id="progressSection" style="display:none;">
+          <div class="progress-bar-wrapper">
+            <div class="progress-bar" id="progressBar"></div>
+          </div>
+          <div class="progress-text" id="progressText">准备中...</div>
+        </div>
+      </section>
+
+      <!-- 面板4: 结果展示 -->
+      <section class="panel" id="panel-result" style="display:none;">
+        <div class="panel-header">
+          <h2>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+              <polyline points="22 4 12 14.01 9 11.01"/>
+            </svg>
+            采集结果
+          </h2>
+          <div class="header-actions">
+            <button class="btn btn-sm btn-success" id="btnDownloadResult">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              下载Excel结果
+            </button>
+          </div>
+        </div>
+
+        <!-- 统计卡片 -->
+        <div class="stats-grid" id="statsGrid">
+          <div class="stat-card stat-total">
+            <div class="stat-value" id="statTotal">0</div>
+            <div class="stat-label">总指标数</div>
+          </div>
+          <div class="stat-card stat-success">
+            <div class="stat-value" id="statSuccess">0</div>
+            <div class="stat-label">成功采集</div>
+          </div>
+          <div class="stat-card stat-fail">
+            <div class="stat-value" id="statFail">0</div>
+            <div class="stat-label">未找到</div>
+          </div>
+          <div class="stat-card stat-time">
+            <div class="stat-value" id="statTime">0s</div>
+            <div class="stat-label">耗时</div>
+          </div>
+        </div>
+
+        <!-- 结果表格 -->
+        <div class="table-wrapper">
+          <table class="data-table" id="resultTable">
+            <thead>
+              <tr>
+                <th width="30">#</th>
+                <th>指标</th>
+                <th>匹配关键字</th>
+                <th>匹配行内容</th>
+                <th>文件路径</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- AI 辅助分析面板 -->
+      <section class="panel" id="aiPanel">
+        <div class="panel-header">
+          <h2>🤖 AI 辅助分析</h2>
+          <div class="ai-status" id="aiStatus">
+            <span class="status-dot" id="aiStatusDot"></span>
+            <span id="aiStatusText">检测中...</span>
+          </div>
+        </div>
+
+        <!-- AI 引擎选择 -->
+        <div class="ai-config">
+          <div class="ai-config-row">
+            <label>AI 引擎：</label>
+            <div class="ai-engine-selector">
+              <label class="radio-label">
+                <input type="radio" name="aiEngine" value="ollama" checked>
+                <span>Ollama (本地)</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="aiEngine" value="deepseek">
+                <span>DeepSeek (云端)</span>
+              </label>
+            </div>
+          </div>
+          <div class="ai-config-row" id="modelSelectRow">
+            <label>模型：</label>
+            <select id="aiModelSelect" class="form-select">
+              <option value="">加载中...</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- AI 功能按钮 -->
+        <div class="ai-actions">
+          <button class="btn btn-ai" id="btnAiMatch" onclick="handleAiMatch()">
+            <span>🔍</span> AI 参数匹配
+          </button>
+          <button class="btn btn-ai" id="btnAiDiscover" onclick="handleAiDiscover()">
+            <span>🔬</span> 未知参数发现
+          </button>
+          <button class="btn btn-ai" id="btnAiTemplate" onclick="handleAiTemplate()">
+            <span>📝</span> 智能生成模板
+          </button>
+        </div>
+
+        <!-- AI 输入区域 -->
+        <div class="ai-input-area" id="aiInputArea" style="display:none;">
+          <div class="ai-input-header">
+            <span id="aiInputTitle">AI 分析</span>
+            <button class="btn-close" onclick="closeAiInput()">✕</button>
+          </div>
+          <div id="aiInputContent"></div>
+        </div>
+
+        <!-- AI 输出区域 -->
+        <div class="ai-output" id="aiOutput">
+          <div class="ai-output-placeholder">
+            <p>选择上方功能开始 AI 分析</p>
+            <p class="ai-hint">💡 数据仅在本地处理，不会上传到外部服务器</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 采集经验库 -->
+      <section class="panel" id="experiencePanel">
+        <div class="panel-header">
+          <h2><span class="panel-icon">📚</span> 采集经验库</h2>
+          <div class="panel-actions">
+            <button class="btn btn-secondary" id="btnRefreshExp"> 刷新</button>
+          </div>
+        </div>
+        <div class="exp-toolbar">
+          <div class="exp-filter">
+            <select id="expVendorFilter">
+              <option value="">全部厂商</option>
+            </select>
+            <select id="expTypeFilter">
+              <option value="">全部类型</option>
+            </select>
+          </div>
+          <button class="btn btn-danger btn-sm" id="btnBatchDeleteExp">🗑️ 批量删除</button>
+        </div>
+        <div class="exp-list" id="expList">
+          <div class="empty-state">
+            <p>暂无采集记录</p>
+            <p class="hint">成功采集并保存后，记录会显示在这里</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 保存确认弹窗 -->
+    <div class="modal-overlay" id="saveConfirmModal" style="display:none;">
+      <div class="modal">
+        <div class="modal-header">
+          <h3>💾 保存到经验库</h3>
+          <button class="modal-close" onclick="closeSaveModal()">✕</button>
+        </div>
+        <div class="modal-body">
+          <p>本次采集已完成，是否将采集配置保存到经验库？</p>
+          <div class="save-form">
+            <div class="form-group">
+              <label>厂商 <span class="required">*</span></label>
+              <select id="saveVendor">
+                <option value="">请选择</option>
+                <option value="Siemens">Siemens（西门子）</option>
+                <option value="GE">GE（通用电气）</option>
+                <option value="Philips">Philips（飞利浦）</option>
+                <option value="Canon">Canon（佳能）</option>
+                <option value="Hitachi">Hitachi（日立）</option>
+                <option value="United Imaging">United Imaging（联影）</option>
+                <option value="其他">其他</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>设备类型 <span class="required">*</span></label>
+              <select id="saveDeviceType">
+                <option value="">请选择</option>
+                <option value="MRI">MRI（磁共振）</option>
+                <option value="CT">CT（计算机断层）</option>
+                <option value="DR">DR（数字X光）</option>
+                <option value="DSA">DSA（数字减影血管造影）</option>
+                <option value="PET-CT">PET-CT</option>
+                <option value="超声">超声</option>
+                <option value="其他">其他</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>设备型号</label>
+              <input type="text" id="saveModel" placeholder="如：MAGNETOM Skyra、Revolution CT">
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" onclick="closeSaveModal()">取消</button>
+          <button class="btn btn-primary" id="btnConfirmSave">💾 保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 编辑记录弹窗 -->
+    <div class="modal-overlay" id="editExpModal" style="display:none;">
+      <div class="modal modal-large">
+        <div class="modal-header">
+          <h3>✏️ 编辑采集记录</h3>
+          <button class="modal-close" onclick="closeEditModal()">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="save-form">
+            <div class="form-group">
+              <label>厂商</label>
+              <input type="text" id="editVendor">
+            </div>
+            <div class="form-group">
+              <label>设备类型</label>
+              <input type="text" id="editDeviceType">
+            </div>
+            <div class="form-group">
+              <label>设备型号</label>
+              <input type="text" id="editModel">
+            </div>
+          </div>
+          <h4 style="margin:16px 0 8px;">采集规则</h4>
+          <div class="exp-rules-table" id="editRulesTable"></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" onclick="closeEditModal()">取消</button>
+          <button class="btn btn-primary" id="btnConfirmEdit">💾 保存修改</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 底部状态栏 -->
+    <footer class="app-footer">
+      <span>大放设备参数采集程序 v3.0</span>
+      <span id="footerStatus">就绪</span>
+    </footer>
+  </div>
+
+  <!-- Toast 通知 -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="app.js?v=3.1"></script>
+</body>
+</html>
