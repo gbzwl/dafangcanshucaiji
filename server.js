@@ -309,6 +309,40 @@ app.get('/api/v1/index/status/:diskRoot', (req, res) => {
 
 // ============ 采集任务 ============
 
+// SSE 实时扫描进度推送
+let scanStreamClients = [];
+
+app.get('/api/v1/scan-stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  // 添加到客户端列表
+  scanStreamClients.push(res);
+
+  // 发送初始消息
+  res.write('data: {"type":"init","message":"扫描服务已连接"}\n\n');
+
+  // 客户端断开时移除
+  req.on('close', () => {
+    scanStreamClients = scanStreamClients.filter(client => client !== res);
+    console.log('[SSE] 客户端断开连接');
+  });
+});
+
+// 推送扫描进度到所有客户端
+function pushScanProgress(data) {
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+  scanStreamClients.forEach(client => {
+    try {
+      client.write(message);
+    } catch (err) {
+      console.error('[SSE] 推送失败:', err.message);
+    }
+  });
+}
+
 // 执行完整的采集任务（v2: 三级匹配 + 可信度）
 app.post('/api/v1/collect', (req, res) => {
   try {
@@ -326,10 +360,21 @@ app.post('/api/v1/collect', (req, res) => {
     // 策略：优先在参考文件中查找，找不到则全盘扫描
     let allFilesCache = null; // 缓存全盘扫描结果，避免重复扫描
     let fallbackUsed = false;
+    let totalFilesScanned = 0;
+
+    // 推送开始消息
+    pushScanProgress({ type: 'start', totalRules: rules.length });
 
     for (const rule of rules) {
       const filePattern = rule.filePattern || rule.file_pattern || '';
       let files = [];
+
+      // 推送当前规则
+      pushScanProgress({
+        type: 'rule_start',
+        indicator: rule.indicator,
+        filePattern: filePattern
+      });
 
       // 1. 优先在参考文件中查找（支持逗号分隔的多个路径）
       if (filePattern && filePattern.trim() !== '') {
@@ -338,6 +383,15 @@ app.post('/api/v1/collect', (req, res) => {
         for (const pattern of patterns) {
           const matched = scanDiskForFiles(diskRoot, pattern, usedIndex);
           files.push(...matched);
+          // 推送每个文件
+          matched.forEach(f => {
+            pushScanProgress({
+              type: 'file_scanned',
+              file: f,
+              indicator: rule.indicator,
+              status: 'matched'
+            });
+          });
         }
         // 去重
         files = [...new Set(files)];
@@ -349,12 +403,26 @@ app.post('/api/v1/collect', (req, res) => {
         if (!allFilesCache) {
           allFilesCache = scanAllLogFiles(diskRoot, usedIndex);
           console.log(`[采集] 全盘扫描找到 ${allFilesCache.length} 个日志文件`);
+          pushScanProgress({
+            type: 'full_scan',
+            totalFiles: allFilesCache.length
+          });
         }
         files = allFilesCache;
         fallbackUsed = true;
       }
 
-      files.forEach(f => allMatchedFiles.add(f));
+      files.forEach(f => {
+        allMatchedFiles.add(f);
+        totalFilesScanned++;
+      });
+
+      // 推送规则完成
+      pushScanProgress({
+        type: 'rule_complete',
+        indicator: rule.indicator,
+        filesFound: files.length
+      });
 
       // 关键字：优先使用模板中的关键字，否则使用指标名称
       const keyword = rule.keyword || rule.indicator || '';
@@ -375,6 +443,12 @@ app.post('/api/v1/collect', (req, res) => {
         file_pattern: filePattern
       });
     }
+
+    // 推送扫描完成
+    pushScanProgress({
+      type: 'scan_complete',
+      totalFiles: allMatchedFiles.size
+    });
 
     // 第二步：三级匹配提取参数
     const results = batchExtract(tasks);

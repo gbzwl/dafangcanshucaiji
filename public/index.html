@@ -227,6 +227,44 @@
       </section>
 
       <!-- 面板4: 结果展示 -->
+      <!-- 扫描进度面板 -->
+      <section class="panel" id="panel-scan-progress" style="display:none;">
+        <div class="panel-header">
+          <h2>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            扫描进度
+          </h2>
+          <div class="header-actions">
+            <span id="scanStatusText" class="scan-status-text">准备中...</span>
+          </div>
+        </div>
+
+        <div class="scan-progress-container">
+          <div class="scan-stats">
+            <div class="scan-stat-item">
+              <span class="scan-stat-label">已扫描文件:</span>
+              <span class="scan-stat-value" id="scanFileCount">0</span>
+            </div>
+            <div class="scan-stat-item">
+              <span class="scan-stat-label">匹配文件:</span>
+              <span class="scan-stat-value" id="scanMatchCount">0</span>
+            </div>
+            <div class="scan-stat-item">
+              <span class="scan-stat-label">当前指标:</span>
+              <span class="scan-stat-value" id="scanCurrentIndicator">-</span>
+            </div>
+          </div>
+
+          <div class="scan-file-list" id="scanFileList">
+            <!-- 扫描文件列表将在这里动态添加 -->
+          </div>
+        </div>
+      </section>
+
       <section class="panel" id="panel-result" style="display:none;">
         <div class="panel-header">
           <h2>

@@ -371,7 +371,58 @@ async function startCollection() {
   showProgress(true, '正在扫描文件并提取参数...');
   updateFooterStatus('采集中...');
 
+  // 显示扫描进度面板
+  const scanProgressPanel = $('#panel-scan-progress');
+  if (scanProgressPanel) {
+    scanProgressPanel.style.display = 'block';
+    $('#scanFileList').innerHTML = '';
+    $('#scanFileCount').textContent = '0';
+    $('#scanMatchCount').textContent = '0';
+    $('#scanCurrentIndicator').textContent = '-';
+    $('#scanStatusText').textContent = '连接中...';
+  }
+
+  // 连接 SSE 监听扫描进度
+  let scanEventSource = null;
+  let scannedFileCount = 0;
+  let matchedFileCount = 0;
+
   try {
+    scanEventSource = new EventSource('/api/v1/scan-stream');
+    
+    scanEventSource.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      
+      if (data.type === 'init') {
+        $('#scanStatusText').textContent = '已连接';
+      } else if (data.type === 'start') {
+        $('#scanStatusText').textContent = '扫描中...';
+      } else if (data.type === 'rule_start') {
+        $('#scanCurrentIndicator').textContent = data.indicator;
+        addScanFileEntry('🔍', `开始扫描指标：${data.indicator}`, 'scanning');
+      } else if (data.type === 'file_scanned') {
+        scannedFileCount++;
+        $('#scanFileCount').textContent = scannedFileCount;
+        if (data.status === 'matched') {
+          matchedFileCount++;
+          $('#scanMatchCount').textContent = matchedFileCount;
+          addScanFileEntry('✅', data.file, 'matched', data.indicator);
+        }
+      } else if (data.type === 'full_scan') {
+        addScanFileEntry('📂', `全盘扫描：找到 ${data.totalFiles} 个日志文件`, 'info');
+      } else if (data.type === 'rule_complete') {
+        addScanFileEntry('✔️', `指标 ${data.indicator} 完成，找到 ${data.filesFound} 个文件`, 'complete');
+      } else if (data.type === 'scan_complete') {
+        $('#scanStatusText').textContent = '扫描完成';
+        addScanFileEntry('🎉', `扫描完成！共扫描 ${data.totalFiles} 个文件`, 'complete');
+      }
+    };
+
+    scanEventSource.onerror = (err) => {
+      console.error('SSE 错误:', err);
+      $('#scanStatusText').textContent = '连接断开';
+    };
+
     const res = await fetch('/api/v1/collect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -406,7 +457,32 @@ async function startCollection() {
     if (btnAiFill) btnAiFill.disabled = false; // 恢复AI补全按钮
     showProgress(false);
     updateFooterStatus('就绪');
+    
+    // 关闭 SSE 连接
+    if (scanEventSource) {
+      scanEventSource.close();
+    }
   }
+}
+
+// 添加扫描文件条目
+function addScanFileEntry(icon, text, type, indicator = '') {
+  const fileList = $('#scanFileList');
+  if (!fileList) return;
+
+  const entry = document.createElement('div');
+  entry.className = `scan-file-entry scan-file-${type}`;
+  
+  const indicatorLabel = indicator ? `<span class="scan-file-indicator">[${indicator}]</span>` : '';
+  entry.innerHTML = `
+    <span class="scan-file-icon">${icon}</span>
+    <span class="scan-file-text">${indicatorLabel}${text}</span>
+  `;
+  
+  fileList.appendChild(entry);
+  
+  // 自动滚动到底部
+  fileList.scrollTop = fileList.scrollHeight;
 }
 
 function renderResults(results, scanLog) {
@@ -521,16 +597,6 @@ function formatPath(filePath) {
   const parts = filePath.replace(/\\/g, '/').split('/');
   if (parts.length <= 3) return filePath;
   return '.../' + parts.slice(-3).join('/');
-}
-
-function escapeHtml(text) {
-  if (!text) return '';
-  return String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
 }
 
 function updateCollectButton() {

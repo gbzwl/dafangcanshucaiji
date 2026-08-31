@@ -939,6 +939,117 @@ body {
   }
 }
 
+/* ==================== 扫描进度面板样式 ==================== */
+
+#panel-scan-progress {
+  margin-bottom: 16px;
+}
+
+.scan-status-text {
+  font-size: 14px;
+  color: #64748b;
+  font-weight: 500;
+}
+
+.scan-progress-container {
+  padding: 16px 0;
+}
+
+.scan-stats {
+  display: flex;
+  gap: 24px;
+  margin-bottom: 16px;
+  padding: 12px 16px;
+  background: #f8fafc;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+}
+
+.scan-stat-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scan-stat-label {
+  font-size: 13px;
+  color: #64748b;
+}
+
+.scan-stat-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.scan-file-list {
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fafafa;
+}
+
+.scan-file-entry {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  margin-bottom: 6px;
+  border-radius: 6px;
+  font-size: 13px;
+  animation: slideIn 0.2s ease-out;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.scan-file-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.scan-file-text {
+  flex: 1;
+  color: #334155;
+  word-break: break-all;
+}
+
+.scan-file-indicator {
+  color: #6366f1;
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.scan-file-scanning {
+  background: #eff6ff;
+  border-left: 3px solid #3b82f6;
+}
+
+.scan-file-matched {
+  background: #f0fdf4;
+  border-left: 3px solid #22c55e;
+}
+
+.scan-file-info {
+  background: #fef3c7;
+  border-left: 3px solid #f59e0b;
+}
+
+.scan-file-complete {
+  background: #f5f3ff;
+  border-left: 3px solid #8b5cf6;
+}
+
 /* ==================== AI 面板样式 ==================== */
 
 .ai-status {
