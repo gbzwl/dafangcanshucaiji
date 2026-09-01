@@ -313,16 +313,22 @@ app.get('/api/v1/index/status/:diskRoot', (req, res) => {
 let scanStreamClients = [];
 
 app.get('/api/v1/scan-stream', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Accel-Buffering', 'no'); // 禁用 Nginx 缓冲
+
+  // 禁用响应缓冲
+  res.socket.setNoDelay(true);
 
   // 添加到客户端列表
   scanStreamClients.push(res);
 
   // 发送初始消息
-  res.write('data: {"type":"init","message":"扫描服务已连接"}\n\n');
+  const initMsg = 'data: {"type":"init","message":"扫描服务已连接"}\n\n';
+  res.write(initMsg);
+  if (res.flush) res.flush();
 
   // 客户端断开时移除
   req.on('close', () => {
@@ -337,6 +343,7 @@ function pushScanProgress(data) {
   scanStreamClients.forEach(client => {
     try {
       client.write(message);
+      if (client.flush) client.flush();
     } catch (err) {
       console.error('[SSE] 推送失败:', err.message);
     }
@@ -348,14 +355,19 @@ function pushScanProgress(data) {
 let aiThinkingClients = [];
 
 app.get('/api/v1/ai-thinking-stream', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  res.socket.setNoDelay(true);
 
   aiThinkingClients.push(res);
 
-  res.write('data: {"type":"init","message":"AI 思考服务已连接"}\n\n');
+  const initMsg = 'data: {"type":"init","message":"AI 思考服务已连接"}\n\n';
+  res.write(initMsg);
+  if (res.flush) res.flush();
 
   req.on('close', () => {
     aiThinkingClients = aiThinkingClients.filter(client => client !== res);
@@ -368,6 +380,7 @@ function pushAiThinking(data) {
   aiThinkingClients.forEach(client => {
     try {
       client.write(message);
+      if (client.flush) client.flush();
     } catch (err) {
       console.error('[AI SSE] 推送失败:', err.message);
     }

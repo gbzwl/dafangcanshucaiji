@@ -183,6 +183,28 @@
         </div>
       </section>
 
+      <!-- AI 思考过程面板 -->
+      <section class="panel" id="panel-ai-thinking" style="display:none;">
+        <div class="panel-header">
+          <h2>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2z"/>
+              <path d="M12 6v6l4 2"/>
+            </svg>
+            AI 思考过程
+          </h2>
+          <div class="header-actions">
+            <span id="aiThinkingStatus" class="scan-status-text">准备中...</span>
+          </div>
+        </div>
+
+        <div class="ai-thinking-container">
+          <div class="ai-thinking-list" id="aiThinkingList">
+            <!-- AI 思考过程将在这里动态添加 -->
+          </div>
+        </div>
+      </section>
+
       <!-- 面板3: 执行采集 -->
       <section class="panel" id="panel-collect">
         <div class="panel-header">
@@ -265,27 +287,7 @@
         </div>
       </section>
 
-      <!-- AI 思考过程面板 -->
-      <section class="panel" id="panel-ai-thinking" style="display:none;">
-        <div class="panel-header">
-          <h2>
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2z"/>
-              <path d="M12 6v6l4 2"/>
-            </svg>
-            AI 思考过程
-          </h2>
-          <div class="header-actions">
-            <span id="aiThinkingStatus" class="scan-status-text">准备中...</span>
-          </div>
-        </div>
 
-        <div class="ai-thinking-container">
-          <div class="ai-thinking-list" id="aiThinkingList">
-            <!-- AI 思考过程将在这里动态添加 -->
-          </div>
-        </div>
-      </section>
 
       <section class="panel" id="panel-result" style="display:none;">
         <div class="panel-header">
@@ -346,69 +348,6 @@
         </div>
       </section>
 
-      <!-- AI 辅助分析面板 -->
-      <section class="panel" id="aiPanel">
-        <div class="panel-header">
-          <h2>🤖 AI 辅助分析</h2>
-          <div class="ai-status" id="aiStatus">
-            <span class="status-dot" id="aiStatusDot"></span>
-            <span id="aiStatusText">检测中...</span>
-          </div>
-        </div>
-
-        <!-- AI 引擎选择 -->
-        <div class="ai-config">
-          <div class="ai-config-row">
-            <label>AI 引擎：</label>
-            <div class="ai-engine-selector">
-              <label class="radio-label">
-                <input type="radio" name="aiEngine" value="ollama" checked>
-                <span>Ollama (本地)</span>
-              </label>
-              <label class="radio-label">
-                <input type="radio" name="aiEngine" value="deepseek">
-                <span>DeepSeek (云端)</span>
-              </label>
-            </div>
-          </div>
-          <div class="ai-config-row" id="modelSelectRow">
-            <label>模型：</label>
-            <select id="aiModelSelect" class="form-select">
-              <option value="">加载中...</option>
-            </select>
-          </div>
-        </div>
-
-        <!-- AI 功能按钮 -->
-        <div class="ai-actions">
-          <button class="btn btn-ai" id="btnAiMatch" onclick="handleAiMatch()">
-            <span>🔍</span> AI 参数匹配
-          </button>
-          <button class="btn btn-ai" id="btnAiDiscover" onclick="handleAiDiscover()">
-            <span>🔬</span> 未知参数发现
-          </button>
-          <button class="btn btn-ai" id="btnAiTemplate" onclick="handleAiTemplate()">
-            <span>📝</span> 智能生成模板
-          </button>
-        </div>
-
-        <!-- AI 输入区域 -->
-        <div class="ai-input-area" id="aiInputArea" style="display:none;">
-          <div class="ai-input-header">
-            <span id="aiInputTitle">AI 分析</span>
-            <button class="btn-close" onclick="closeAiInput()">✕</button>
-          </div>
-          <div id="aiInputContent"></div>
-        </div>
-
-        <!-- AI 输出区域 -->
-        <div class="ai-output" id="aiOutput">
-          <div class="ai-output-placeholder">
-            <p>选择上方功能开始 AI 分析</p>
-            <p class="ai-hint">💡 数据仅在本地处理，不会上传到外部服务器</p>
-          </div>
-        </div>
-      </section>
 
       <!-- 采集经验库 -->
       <section class="panel" id="experiencePanel">
