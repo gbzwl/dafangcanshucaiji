@@ -1079,21 +1079,25 @@ async function checkAiStatus() {
     const res = await fetch('/api/v1/ai/status');
     const data = await res.json();
 
-    if (data.ollama && data.ollama.available) {
-      dot.className = 'status-dot connected';
-      text.textContent = 'Ollama 已连接';
-      // 加载 Ollama 本地模型列表
-      loadOllamaModels();
-    } else if (data.deepseek && data.deepseek.available) {
-      dot.className = 'status-dot connected';
-      text.textContent = 'DeepSeek 已连接';
-    } else {
-      dot.className = 'status-dot error';
-      text.textContent = 'AI 服务不可用';
+    if (dot && text) {
+      if (data.ollama && data.ollama.available) {
+        dot.className = 'status-dot connected';
+        text.textContent = 'Ollama 已连接';
+        // 加载 Ollama 本地模型列表
+        loadOllamaModels();
+      } else if (data.deepseek && data.deepseek.available) {
+        dot.className = 'status-dot connected';
+        text.textContent = 'DeepSeek 已连接';
+      } else {
+        dot.className = 'status-dot error';
+        text.textContent = 'AI 服务不可用';
+      }
     }
   } catch {
-    dot.className = 'status-dot error';
-    text.textContent = '无法连接 AI 服务';
+    if (dot && text) {
+      dot.className = 'status-dot error';
+      text.textContent = '无法连接 AI 服务';
+    }
   }
 }
 

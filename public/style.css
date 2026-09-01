@@ -1951,3 +1951,82 @@ body {
 }
   border-color: #94a3b8;
 }
+
+/* AI 选择器样式 */
+.ai-selector-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 20px;
+  background: #f8fafc;
+  border-radius: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.ai-selector-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ai-selector-group label {
+  font-size: 14px;
+  font-weight: 500;
+  color: #475569;
+  white-space: nowrap;
+}
+
+.radio-group {
+  display: flex;
+  gap: 12px;
+}
+
+.radio-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  color: #475569;
+}
+
+.radio-label input[type="radio"] {
+  cursor: pointer;
+}
+
+.ai-model-select {
+  padding: 6px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  font-size: 14px;
+  background: white;
+  min-width: 150px;
+}
+
+.ai-model-select:focus {
+  outline: none;
+  border-color: #6366f1;
+}
+
+#btnAiFill {
+  margin-left: auto;
+  padding: 8px 16px;
+  background: #6366f1;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+#btnAiFill:hover:not(:disabled) {
+  background: #4f46e5;
+}
+
+#btnAiFill:disabled {
+  background: #94a3b8;
+  cursor: not-allowed;
+}
