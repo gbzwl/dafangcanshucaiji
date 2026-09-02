@@ -59,6 +59,7 @@ export async function initExperienceDB() {
         file_pattern TEXT DEFAULT '',
         keyword TEXT DEFAULT '',
         synonyms TEXT DEFAULT '',
+        keyword_meaning TEXT DEFAULT '',
         actual_path TEXT DEFAULT '',
         match_method TEXT DEFAULT '',
         confidence INTEGER DEFAULT 0,
@@ -68,6 +69,7 @@ export async function initExperienceDB() {
 
     db.run('CREATE INDEX IF NOT EXISTS idx_rules_record ON collection_rules(record_id)');
     db.run('CREATE INDEX IF NOT EXISTS idx_records_vendor ON collection_records(vendor, device_type)');
+    ensureColumn('collection_rules', 'keyword_meaning', "TEXT DEFAULT ''");
 
     saveDB();
     console.log('采集经验库已初始化');
@@ -83,6 +85,14 @@ function saveDB() {
     const data = db.export();
     const buffer = Buffer.from(data);
     fs.writeFileSync(DB_PATH, buffer);
+  }
+}
+
+function ensureColumn(tableName, columnName, definition) {
+  const info = db.exec(`PRAGMA table_info(${tableName})`);
+  const columns = info[0]?.values?.map(row => row[1]) || [];
+  if (!columns.includes(columnName)) {
+    db.run(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
   }
 }
 
@@ -127,8 +137,8 @@ export function saveCollectionRecord(data) {
   // 插入规则
   if (rules.length > 0) {
     const ruleStmt = db.prepare(`
-      INSERT INTO collection_rules (record_id, indicator, file_pattern, keyword, synonyms, actual_path, match_method, confidence)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO collection_rules (record_id, indicator, file_pattern, keyword, synonyms, keyword_meaning, actual_path, match_method, confidence)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     for (const rule of rules) {
@@ -138,6 +148,7 @@ export function saveCollectionRecord(data) {
         rule.filePattern || rule.file_pattern || '',
         rule.keyword || '',
         rule.synonyms ? (Array.isArray(rule.synonyms) ? rule.synonyms.join(';') : rule.synonyms) : '',
+        rule.keywordMeaning || rule.keyword_meaning || '',
         rule.actualPath || rule.actual_path || '',
         rule.matchMethod || rule.match_method || '',
         rule.confidence || 0
@@ -251,6 +262,7 @@ export function getRecordDetail(recordId) {
         filePattern: obj.file_pattern,
         keyword: obj.keyword,
         synonyms: obj.synonyms,
+        keywordMeaning: obj.keyword_meaning || '',
         actualPath: obj.actual_path,
         matchMethod: obj.match_method,
         confidence: obj.confidence
@@ -293,6 +305,7 @@ export function findMatchingRecords(vendor, deviceType) {
           filePattern: obj.file_pattern,
           keyword: obj.keyword,
           synonyms: obj.synonyms,
+          keywordMeaning: obj.keyword_meaning || '',
           actualPath: obj.actual_path,
           matchMethod: obj.match_method,
           confidence: obj.confidence
@@ -345,8 +358,8 @@ export function updateRecord(recordId, data) {
 
     if (data.rules.length > 0) {
       const ruleStmt = db.prepare(`
-        INSERT INTO collection_rules (record_id, indicator, file_pattern, keyword, synonyms, actual_path, match_method, confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO collection_rules (record_id, indicator, file_pattern, keyword, synonyms, keyword_meaning, actual_path, match_method, confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       for (const rule of data.rules) {
@@ -356,6 +369,7 @@ export function updateRecord(recordId, data) {
           rule.filePattern || rule.file_pattern || '',
           rule.keyword || '',
           rule.synonyms ? (Array.isArray(rule.synonyms) ? rule.synonyms.join(';') : rule.synonyms) : '',
+          rule.keywordMeaning || rule.keyword_meaning || '',
           rule.actualPath || rule.actual_path || '',
           rule.matchMethod || rule.match_method || '',
           rule.confidence || 0

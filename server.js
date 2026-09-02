@@ -19,10 +19,18 @@ import fs from 'fs';
 import iconv from 'iconv-lite';
 import { fileURLToPath } from 'url';
 import { getAvailableDisks } from './core/scanner.js';
-import { scanDiskForFiles, scanAllLogFiles, initIndex, buildFileIndex, checkIndexStatus } from './core/matcher.js';
-import { extractParameter, batchExtract } from './core/extractor.js';
+import {
+  scanReferenceFilesWithProgress,
+  scanFileGlobsWithProgress,
+  scanAllLogFilesWithProgressOptions,
+  buildFileGlobCandidates,
+  initIndex,
+  buildFileIndex,
+  checkIndexStatus
+} from './core/matcher.js';
+import { extractParameter, batchExtractWithProgress } from './core/extractor.js';
 import { parseTemplate, generateResultExcel, generateTemplateExample } from './core/excel-handler.js';
-import { callAI, checkAIService, getAvailableBackends, extractJSON } from './core/ai-service.js';
+import { callAI, callAIStream, checkAIService, getAvailableBackends, extractJSON } from './core/ai-service.js';
 import { aiMatchParameter, aiBatchMatch } from './core/ai-matcher.js';
 import { discoverUnknownParameters, scanLogFiles, extractFieldsFromFile } from './core/ai-discoverer.js';
 import { generateTemplate, saveTemplateToExcel, extractAvailableFields } from './core/ai-template-gen.js';
@@ -312,6 +320,19 @@ app.get('/api/v1/index/status/:diskRoot', (req, res) => {
 // SSE 实时扫描进度推送
 let scanStreamClients = [];
 
+const waitForFlush = () => new Promise(resolve => setImmediate(resolve));
+const AI_AUTOFILL_ITEM_TIMEOUT = Number(process.env.AI_AUTOFILL_ITEM_TIMEOUT || 60000);
+const AI_AUTOFILL_MAX_TOKENS = Number(process.env.AI_AUTOFILL_MAX_TOKENS || 1600);
+const COLLECTION_L2_MAX_FILES = Number(process.env.COLLECTION_L2_MAX_FILES || 15000);
+const COLLECTION_L3_MAX_FILES = Number(process.env.COLLECTION_L3_MAX_FILES || 5000);
+const COLLECTION_PROGRESS_EVERY = Number(process.env.COLLECTION_PROGRESS_EVERY || 200);
+
+function normalizeDiskRoot(diskRoot) {
+  const value = String(diskRoot || '').trim();
+  if (/^[a-z]:$/i.test(value)) return value + '\\';
+  return value;
+}
+
 app.get('/api/v1/scan-stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -348,6 +369,11 @@ function pushScanProgress(data) {
       console.error('[SSE] 推送失败:', err.message);
     }
   });
+}
+
+async function pushScanProgressNow(data) {
+  pushScanProgress(data);
+  await waitForFlush();
 }
 
 // ============ AI 思考过程 SSE ============
@@ -387,130 +413,95 @@ function pushAiThinking(data) {
   });
 }
 
+async function pushAiThinkingNow(data) {
+  pushAiThinking(data);
+  await waitForFlush();
+}
+
 // 执行完整的采集任务（v2: 三级匹配 + 可信度）
-app.post('/api/v1/collect', (req, res) => {
+app.post('/api/v1/collect', async (req, res) => {
+  const requestController = new AbortController();
+  req.on('aborted', () => requestController.abort());
+  res.on('close', () => {
+    if (!res.writableEnded) requestController.abort();
+  });
+
   try {
-    const { diskRoot, rules, useIndex = true } = req.body;
-    if (!diskRoot || !rules || !Array.isArray(rules)) {
-      return res.status(400).json({ success: false, error: '缺少必要参数: diskRoot, rules' });
+    const { diskRoot, diskRoots, rules, useIndex = true } = req.body;
+    const targetDisks = (Array.isArray(diskRoots) && diskRoots.length > 0 ? diskRoots : [diskRoot])
+      .map(disk => normalizeDiskRoot(disk))
+      .filter(Boolean);
+
+    if (targetDisks.length === 0 || !rules || !Array.isArray(rules)) {
+      return res.status(400).json({ success: false, error: '缺少必要参数: diskRoot/diskRoots, rules' });
     }
 
     const startTime = Date.now();
     const allMatchedFiles = new Set();
-    const tasks = [];
-    const usedIndex = useIndex && indexReady;
-
-    // 第一步：为每条规则扫描匹配文件
-    // 策略：优先在参考文件中查找，找不到则全盘扫描
-    let allFilesCache = null; // 缓存全盘扫描结果，避免重复扫描
+    const results = [];
+    const usedIndex = false;
     let fallbackUsed = false;
-    let totalFilesScanned = 0;
+    let stopped = false;
 
     // 推送开始消息
-    pushScanProgress({ type: 'start', totalRules: rules.length });
+    await pushScanProgressNow({ type: 'start', totalRules: rules.length, totalDisks: targetDisks.length });
 
-    for (const rule of rules) {
-      const filePattern = rule.filePattern || rule.file_pattern || '';
-      let files = [];
+    for (const currentDisk of targetDisks) {
+      if (requestController.signal.aborted) {
+        stopped = true;
+        break;
+      }
 
-      // 推送当前规则
-      pushScanProgress({
-        type: 'rule_start',
-        indicator: rule.indicator,
-        filePattern: filePattern
-      });
+      await pushScanProgressNow({ type: 'disk_start', diskRoot: currentDisk });
 
-      // 1. 优先在参考文件中查找（支持逗号分隔的多个路径）
-      if (filePattern && filePattern.trim() !== '') {
-        // 拆分逗号分隔的多个路径
-        const patterns = filePattern.split(',').map(p => p.trim()).filter(p => p);
-        for (const pattern of patterns) {
-          const matched = scanDiskForFiles(diskRoot, pattern, usedIndex);
-          files.push(...matched);
-          // 推送每个文件
-          matched.forEach(f => {
-            pushScanProgress({
-              type: 'file_scanned',
-              file: f,
-              indicator: rule.indicator,
-              status: 'matched'
-            });
-          });
+      for (const rule of rules) {
+        if (requestController.signal.aborted) {
+          stopped = true;
+          break;
         }
-        // 去重
-        files = [...new Set(files)];
-        console.log(`[采集] 规则 "${rule.indicator}" 参考文件 "${filePattern}" 找到 ${files.length} 个文件`);
-      }
 
-      // 2. 如果参考文件没找到，全盘扫描所有日志文件
-      if (files.length === 0) {
-        if (!allFilesCache) {
-          allFilesCache = scanAllLogFiles(diskRoot, usedIndex);
-          console.log(`[采集] 全盘扫描找到 ${allFilesCache.length} 个日志文件`);
-          pushScanProgress({
-            type: 'full_scan',
-            totalFiles: allFilesCache.length
-          });
+        const filePattern = rule.filePattern || rule.file_pattern || '';
+
+        await pushScanProgressNow({
+          type: 'rule_start',
+          diskRoot: currentDisk,
+          indicator: rule.indicator,
+          filePattern
+        });
+
+        const levelResults = await collectRuleByLevels(currentDisk, rule, requestController.signal, allMatchedFiles);
+        if (levelResults.stopped) {
+          stopped = true;
+          break;
         }
-        files = allFilesCache;
-        fallbackUsed = true;
+        if (levelResults.fallbackUsed) fallbackUsed = true;
+        results.push(...levelResults.results);
       }
-
-      files.forEach(f => {
-        allMatchedFiles.add(f);
-        totalFilesScanned++;
-      });
-
-      // 推送规则完成
-      pushScanProgress({
-        type: 'rule_complete',
-        indicator: rule.indicator,
-        filesFound: files.length
-      });
-
-      // 关键字：优先使用模板中的关键字，否则使用指标名称
-      const keyword = rule.keyword || rule.indicator || '';
-      const synonyms = rule.synonyms || [];
-
-      // 如果关键字为空，使用指标名称作为关键字
-      if (!keyword && rule.indicator) {
-        synonyms.push(rule.indicator);
-      }
-
-      tasks.push({
-        indicator: rule.indicator,
-        keyword: keyword,
-        synonyms: synonyms,
-        dataType: rule.dataType || '',
-        unit: rule.unit || '',
-        files,
-        file_pattern: filePattern
-      });
     }
 
     // 推送扫描完成
-    pushScanProgress({
-      type: 'scan_complete',
+    await pushScanProgressNow({
+      type: stopped ? 'scan_stopped' : 'scan_complete',
       totalFiles: allMatchedFiles.size
     });
 
     // 第二步：三级匹配提取参数
-    const results = batchExtract(tasks);
-
     const successCount = results.filter(r => r.success).length;
     const failCount = results.filter(r => !r.success).length;
 
     const scanLog = {
       scan_time: new Date().toISOString(),
-      disk: diskRoot,
+      disk: targetDisks.join(', '),
+      disks: targetDisks,
       total_files: allMatchedFiles.size,
       success_count: successCount,
       fail_count: failCount,
-      total_indicators: rules.length,
+      total_indicators: rules.length * targetDisks.length,
       duration: ((Date.now() - startTime) / 1000).toFixed(2),
       template_rules: rules.length,
       used_index: usedIndex,
-      fallback_scan: fallbackUsed
+      fallback_scan: fallbackUsed,
+      stopped
     };
 
     // 第三步：生成结果 Excel
@@ -527,6 +518,157 @@ app.post('/api/v1/collect', (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+async function collectRuleByLevels(diskRoot, rule, signal, allMatchedFiles) {
+  const levels = [
+    {
+      level: 'L1',
+      name: 'L1 参考路径',
+      fallbackUsed: false,
+      scan: async onProgress => {
+        const filePattern = rule.filePattern || rule.file_pattern || '';
+        if (!filePattern || !filePattern.trim()) return [];
+        return scanReferenceFilesWithProgress(diskRoot, filePattern, onProgress, {
+          signal,
+          progressEvery: COLLECTION_PROGRESS_EVERY
+        });
+      }
+    },
+    {
+      level: 'L2',
+      name: 'L2 文件扩展',
+      fallbackUsed: false,
+      scan: async onProgress => scanFileGlobsWithProgress(diskRoot, buildFileGlobCandidates(rule), onProgress, {
+        signal,
+        maxFiles: COLLECTION_L2_MAX_FILES,
+        progressEvery: COLLECTION_PROGRESS_EVERY
+      })
+    },
+    {
+      level: 'L3',
+      name: 'L3 全盘兜底',
+      fallbackUsed: true,
+      scan: async onProgress => scanAllLogFilesWithProgressOptions(diskRoot, onProgress, {
+        signal,
+        maxFiles: COLLECTION_L3_MAX_FILES,
+        progressEvery: COLLECTION_PROGRESS_EVERY
+      })
+    }
+  ];
+
+  let finalResults = [];
+  let usedFallback = false;
+
+  for (const levelInfo of levels) {
+    if (signal.aborted) return { results: finalResults, fallbackUsed: usedFallback, stopped: true };
+
+    await pushScanProgressNow({
+      type: 'scan_level_start',
+      diskRoot,
+      indicator: rule.indicator,
+      level: levelInfo.level,
+      levelName: levelInfo.name
+    });
+
+    const files = await levelInfo.scan(async progress => {
+      await pushScanProgressNow({
+        type: progress.type,
+        diskRoot,
+        indicator: rule.indicator,
+        level: levelInfo.level,
+        levelName: levelInfo.name,
+        dir: progress.dir,
+        file: progress.file,
+        checkedFiles: progress.checkedFiles,
+        matchedFiles: progress.matchedFiles,
+        target: progress.target
+      });
+    });
+
+    const uniqueFiles = [...new Set(files)];
+    uniqueFiles.forEach(file => allMatchedFiles.add(file));
+
+    await pushScanProgressNow({
+      type: 'rule_candidates',
+      diskRoot,
+      indicator: rule.indicator,
+      level: levelInfo.level,
+      levelName: levelInfo.name,
+      filesFound: uniqueFiles.length
+    });
+
+    const levelResults = await extractRuleFromFiles(diskRoot, rule, uniqueFiles, levelInfo, signal);
+    finalResults = levelResults;
+    if (levelInfo.fallbackUsed) usedFallback = true;
+
+    const hit = levelResults.some(result => result.success);
+    await pushScanProgressNow({
+      type: 'scan_level_complete',
+      diskRoot,
+      indicator: rule.indicator,
+      level: levelInfo.level,
+      levelName: levelInfo.name,
+      filesFound: uniqueFiles.length,
+      hit
+    });
+
+    if (signal.aborted) return { results: finalResults, fallbackUsed: usedFallback, stopped: true };
+    if (hit) return { results: finalResults, fallbackUsed: usedFallback, stopped: false };
+  }
+
+  return { results: finalResults, fallbackUsed: usedFallback, stopped: false };
+}
+
+async function extractRuleFromFiles(diskRoot, rule, files, levelInfo, signal) {
+  const keyword = rule.keyword || rule.indicator || '';
+  const synonyms = Array.isArray(rule.synonyms) ? [...rule.synonyms] : [];
+
+  if (!keyword && rule.indicator) {
+    synonyms.push(rule.indicator);
+  }
+
+  await pushScanProgressNow({
+    type: 'extract_start',
+    diskRoot,
+    indicator: rule.indicator,
+    level: levelInfo.level,
+    levelName: levelInfo.name,
+    filesFound: files.length
+  });
+
+  const task = {
+    indicator: rule.indicator,
+    keyword,
+    synonyms,
+    dataType: rule.dataType || '',
+    unit: rule.unit || '',
+    files,
+    file_pattern: rule.filePattern || rule.file_pattern || '',
+    keywordMeaning: rule.keywordMeaning || rule.keyword_meaning || ''
+  };
+
+  return (await batchExtractWithProgress([task], async progress => {
+    await pushScanProgressNow({
+      type: progress.type,
+      diskRoot,
+      indicator: progress.indicator,
+      keyword: progress.keyword,
+      file: progress.file,
+      lineNumber: progress.lineNumber,
+      line: progress.line,
+      matchedWord: progress.matchedWord,
+      checkedFiles: progress.checkedFiles,
+      matchedFiles: progress.matchedFiles,
+      level: levelInfo.level,
+      levelName: levelInfo.name
+    });
+  }, { signal })).map(result => ({
+    ...result,
+    disk_root: diskRoot,
+    scan_level: levelInfo.level,
+    scan_strategy: levelInfo.name
+  }));
+}
 
 // 从单个文件中提取参数（三级匹配）
 app.post('/api/v1/extract', (req, res) => {
@@ -631,6 +773,12 @@ app.post('/api/v1/ai/match', async (req, res) => {
 
 // AI 智能补全（根据指标名称生成关键词和文件路径）
 app.post('/api/v1/ai/autofill', async (req, res) => {
+  const requestController = new AbortController();
+  req.on('aborted', () => requestController.abort());
+  res.on('close', () => {
+    if (!res.writableEnded) requestController.abort();
+  });
+
   try {
     const { indicators, vendor, deviceType, model, backend } = req.body;
 
@@ -639,7 +787,7 @@ app.post('/api/v1/ai/autofill', async (req, res) => {
     }
 
     // 推送开始思考
-    pushAiThinking({
+    await pushAiThinkingNow({
       type: 'start',
       message: `开始分析 ${indicators.length} 个指标`,
       vendor: vendor || '医疗',
@@ -647,74 +795,105 @@ app.post('/api/v1/ai/autofill', async (req, res) => {
     });
 
     const rules = [];
+    const failures = [];
     for (let i = 0; i < indicators.length; i++) {
+      if (requestController.signal.aborted) break;
       const indicator = indicators[i];
 
       // 推送正在分析指标
-      pushAiThinking({
+      await pushAiThinkingNow({
         type: 'analyzing',
         indicator: indicator,
+        index: i + 1,
+        total: indicators.length,
         progress: `${i + 1}/${indicators.length}`
       });
 
-      // 推送搜索经验库
-      pushAiThinking({
-        type: 'thinking',
-        message: '搜索经验库...'
-      });
-
       const prompt = `你是${vendor || '医疗'}${deviceType || '设备'}日志分析专家。
-请为以下指标生成采集关键词：
+请为以下指标生成采集关键词。
 
 指标名称：${indicator}
 
-请按以下JSON格式回答（只回答JSON，不要其他内容）：
+重要限制：
+- 日志中不会出现中文，keyword 和 synonyms 必须全部使用英文或 ASCII 字段名。
+- 不要把中文解释、中文翻译、中文词语放进 keyword 或 synonyms。
+- filePattern 只能使用英文目录名、英文文件名或常见路径片段。
+
+请先输出可展示分析过程，最多 3 行，每行以“分析：”开头，说明你如何判断英文参考日志路径、英文主关键词和英文备用关键词。
+最后单独输出一段 JSON，格式如下：
 {
-  "filePattern": "最可能包含此参数的日志目录（如 MedCom/log, MriSiteData, SysUtil）",
-  "keyword": "最可能的英文字段名",
-  "synonyms": ["备用关键词1", "备用关键词2", "备用关键词3"]
+  "filePattern": "English path fragment, e.g. MedCom/log, MriSiteData, SysUtil",
+  "keyword": "EnglishFieldName",
+  "synonyms": ["EnglishAlias1", "english_alias_2", "EnglishAlias3"],
+  "keywordMeaning": "中文说明：该关键字在日志中通常表示什么，必要时写出关键字段与含义"
 }
 
 如果不确定，filePattern填""，keyword填""，synonyms填[]。`;
 
-      // 推送调用 AI
-      pushAiThinking({
+      await pushAiThinkingNow({
         type: 'thinking',
-        message: `调用 AI 模型分析关键字...`
+        indicator,
+        message: `正在接收 AI 输出...`
       });
 
-      // 使用传入的模型和后端，如果没有则使用默认
-      const aiResult = await callAI(prompt, { timeout: 30000, model: model || undefined, backend: backend || 'ollama' });
-
       let parsed = null;
+      let rawContent = '';
       try {
+        const aiResult = await callAIStream(
+          prompt,
+          {
+            timeout: AI_AUTOFILL_ITEM_TIMEOUT,
+            maxTokens: AI_AUTOFILL_MAX_TOKENS,
+            model: model || undefined,
+            backend: backend || 'ollama',
+            formatJson: false,
+            signal: requestController.signal
+          },
+          token => {
+            rawContent += token;
+            pushAiThinking({
+              type: 'delta',
+              indicator,
+              content: token
+            });
+          }
+        );
+
+        rawContent = aiResult.content || rawContent;
         const jsonMatch = aiResult.content.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           parsed = JSON.parse(jsonMatch[0]);
+          parsed = sanitizeAiAutofillRule(parsed);
           // 推送解析成功
-          pushAiThinking({
+          await pushAiThinkingNow({
             type: 'success',
             indicator: indicator,
             keyword: parsed?.keyword || '',
             synonyms: parsed?.synonyms || [],
-            filePattern: parsed?.filePattern || ''
+            filePattern: parsed?.filePattern || '',
+            keywordMeaning: parsed?.keywordMeaning || '',
+            summary: summarizeAiOutput(rawContent)
           });
         } else {
           console.log('AI 返回内容:', aiResult.content);
-          pushAiThinking({
+          failures.push({ indicator, error: 'AI 返回格式异常' });
+          await pushAiThinkingNow({
             type: 'warning',
             indicator: indicator,
-            message: 'AI 返回格式异常'
+            message: 'AI 返回格式异常，已跳过该指标',
+            summary: summarizeAiOutput(rawContent)
           });
         }
       } catch (e) {
         // AI 返回解析失败，记录日志
         console.error('AI 返回解析失败:', e.message);
-        console.error('AI 原始响应:', aiResult.content?.substring(0, 500));
-        pushAiThinking({
+        console.error('AI 原始响应:', rawContent?.substring(0, 500));
+        failures.push({ indicator, error: e.message });
+        await pushAiThinkingNow({
           type: 'error',
           indicator: indicator,
-          message: '解析失败：' + e.message
+          message: `该指标失败，已继续下一项：${e.message}`,
+          summary: summarizeAiOutput(rawContent)
         });
       }
 
@@ -722,21 +901,64 @@ app.post('/api/v1/ai/autofill', async (req, res) => {
         indicator,
         filePattern: parsed?.filePattern || '',
         keyword: parsed?.keyword || '',
-        synonyms: parsed?.synonyms || []
+        synonyms: parsed?.synonyms || [],
+        keywordMeaning: parsed?.keywordMeaning || ''
       });
     }
 
     // 推送完成
-    pushAiThinking({
+    await pushAiThinkingNow({
       type: 'complete',
-      message: `补全完成！共处理 ${rules.length} 个指标`
+      message: `补全完成：成功 ${rules.length - failures.length}，失败 ${failures.length}`,
+      successCount: rules.length - failures.length,
+      failCount: failures.length,
+      total: rules.length
     });
 
-    res.json({ success: true, rules });
+    res.json({ success: true, rules, failures });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+function summarizeAiOutput(content = '') {
+  const lines = String(content)
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .filter(line => !line.startsWith('{') && !line.startsWith('"') && !line.startsWith('}'))
+    .map(line => line.replace(/^分析[:：]\s*/, ''))
+    .slice(0, 3);
+  return lines.join('\n');
+}
+
+function sanitizeAiAutofillRule(rule = {}) {
+  return {
+    filePattern: sanitizeFilePattern(rule.filePattern || rule.file_pattern || ''),
+    keyword: sanitizeKeyword(rule.keyword || ''),
+    synonyms: sanitizeSynonyms(rule.synonyms || []),
+    keywordMeaning: String(rule.keywordMeaning || rule.keyword_meaning || '').trim()
+  };
+}
+
+function sanitizeFilePattern(value) {
+  return String(value || '')
+    .split(',')
+    .map(part => part.trim())
+    .filter(part => part && /^[A-Za-z0-9_./\\*?\-\s]+$/.test(part))
+    .join(', ');
+}
+
+function sanitizeKeyword(value) {
+  const text = String(value || '').trim();
+  if (!text || /[^\x00-\x7F]/.test(text)) return '';
+  return text.replace(/[^A-Za-z0-9_.:\-\s]/g, '').trim();
+}
+
+function sanitizeSynonyms(value) {
+  const list = Array.isArray(value) ? value : String(value || '').split(/[;,；，]/);
+  return [...new Set(list.map(sanitizeKeyword).filter(Boolean))].slice(0, 8);
+}
 
 // AI 未知参数发现
 app.post('/api/v1/ai/discover', async (req, res) => {
@@ -836,7 +1058,8 @@ app.post('/api/v1/ai/smart-fill', async (req, res) => {
               indicator,
               filePattern: matchedRule.filePattern || '',
               keyword: matchedRule.keyword || '',
-              synonyms: matchedRule.synonyms || ''
+              synonyms: matchedRule.synonyms || '',
+              keywordMeaning: matchedRule.keywordMeaning || matchedRule.keyword_meaning || ''
             };
             rule._fromExperience = true;
             break;
@@ -849,11 +1072,12 @@ app.post('/api/v1/ai/smart-fill', async (req, res) => {
         const aiResult = await aiSmartFill(indicator, vendor, deviceType);
         if (aiResult && aiResult.success) {
           rule = {
-            indicator,
-            filePattern: aiResult.filePattern || '',
-            keyword: aiResult.keyword || '',
-            synonyms: aiResult.synonyms || ''
-          };
+              indicator,
+              filePattern: aiResult.filePattern || '',
+              keyword: aiResult.keyword || '',
+              synonyms: aiResult.synonyms || '',
+              keywordMeaning: aiResult.keywordMeaning || aiResult.keyword_meaning || ''
+            };
         }
       }
 
@@ -985,7 +1209,8 @@ app.post('/api/v1/experience/match', (req, res) => {
               indicator: indicator,
               filePattern: matchedRule.filePattern || '',
               keyword: matchedRule.keyword || '',
-              synonyms: matchedRule.synonyms || ''
+              synonyms: matchedRule.synonyms || '',
+              keywordMeaning: matchedRule.keywordMeaning || matchedRule.keyword_meaning || ''
             });
             break;
           }

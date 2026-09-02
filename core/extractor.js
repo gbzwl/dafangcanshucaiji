@@ -9,6 +9,12 @@
 import fs from 'fs';
 import iconv from 'iconv-lite';
 
+const YIELD_EVERY = 25;
+const waitForYield = () => new Promise(resolve => setImmediate(resolve));
+const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024;
+const LARGE_FILE_TAIL_BYTES = 16 * 1024 * 1024;
+const LARGE_FILE_MAX_LINES = 50000;
+
 /**
  * 从文件中提取参数（精确匹配）
  * @param {string} filePath - 文件路径
@@ -149,6 +155,16 @@ function exactMatch(lines, keyword) {
     }
   }
 
+  const keywordPattern = new RegExp(`\\b${escapedKeyword}\\b`, 'i');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (keywordPattern.test(line)) {
+      const trimmedLine = line.trim();
+      const displayLine = truncateLine(trimmedLine, keyword);
+      return { found: true, value: '-', line: displayLine, lineNumber: i + 1, matchType: 'exact', matchedWord: keyword };
+    }
+  }
+
   return { found: false };
 }
 
@@ -187,6 +203,13 @@ function wordMatch(lines, keyword) {
             return { found: true, value, line: displayLine, lineNumber: i + 1, matchType: 'partial', matchedWord: word };
           }
         }
+      }
+
+      const wordBoundaryPattern = new RegExp(`\\b${escapedWord}\\b`, 'i');
+      if (wordBoundaryPattern.test(line)) {
+        const trimmedLine = line.trim();
+        const displayLine = truncateLine(trimmedLine, word);
+        return { found: true, value: '-', line: displayLine, lineNumber: i + 1, matchType: 'partial', matchedWord: word };
       }
     }
   }
@@ -406,7 +429,8 @@ export function batchExtract(tasks) {
         file_path: null,
         line_number: null,
         match_line: null,
-        file_pattern: task.file_pattern
+        file_pattern: task.file_pattern,
+        keywordMeaning: task.keywordMeaning || task.keyword_meaning || ''
       };
 
       // 如果有数据类型约束，记录
@@ -479,12 +503,244 @@ export function batchExtract(tasks) {
   return results;
 }
 
+export async function batchExtractWithProgress(tasks, onProgress = null, options = {}) {
+  const results = [];
+  let checkedFiles = 0;
+  let matchedFiles = 0;
+
+  for (const task of tasks) {
+    if (options.signal?.aborted) break;
+    const searchKeywords = [];
+    if (task.keyword && task.keyword.trim()) searchKeywords.push({ text: task.keyword.trim(), source: 'keyword' });
+    if (task.synonyms && task.synonyms.length > 0) {
+      for (const syn of task.synonyms) {
+        if (syn && syn.trim()) searchKeywords.push({ text: syn.trim(), source: 'synonym' });
+      }
+    }
+    if (task.indicator && task.indicator.trim() && !searchKeywords.some(k => k.text === task.indicator.trim())) {
+      searchKeywords.push({ text: task.indicator.trim(), source: 'indicator' });
+    }
+
+    for (const searchKey of searchKeywords) {
+      if (options.signal?.aborted) break;
+      const result = {
+        indicator: task.indicator,
+        value: null,
+        success: false,
+        matchedKeyword: searchKey.text,
+        matchType: null,
+        file_path: null,
+        line_number: null,
+        match_line: null,
+        file_pattern: task.file_pattern,
+        keywordMeaning: task.keywordMeaning || task.keyword_meaning || ''
+      };
+
+      if (task.dataType) result.dataType = task.dataType;
+      if (task.unit) result.unit = task.unit;
+
+      for (const filePath of task.files || []) {
+        if (options.signal?.aborted) break;
+        checkedFiles++;
+        if (onProgress) {
+          await onProgress({
+            type: 'extract_file',
+            indicator: task.indicator,
+            keyword: searchKey.text,
+            file: filePath,
+            checkedFiles,
+            matchedFiles
+          });
+        }
+
+        const keywordLine = findKeywordLine(filePath, searchKey.text);
+        if (keywordLine && onProgress) {
+          await onProgress({
+            type: 'keyword_hit',
+            indicator: task.indicator,
+            keyword: searchKey.text,
+            file: filePath,
+            lineNumber: keywordLine.lineNumber,
+            line: keywordLine.line,
+            checkedFiles,
+            matchedFiles
+          });
+        }
+
+        let extractResult = extractParameter(filePath, searchKey.text, [], task.indicator);
+
+        if (extractResult.success && extractResult.value) {
+          if (task.dataType === 'number') {
+            const numMatch = String(extractResult.value).match(/-?[\d.]+/);
+            if (numMatch) {
+              result.value = numMatch[0];
+            } else {
+              continue;
+            }
+          } else {
+            result.value = extractResult.value;
+          }
+
+          result.success = true;
+          result.matchedKeyword = searchKey.text;
+          result.matchType = extractResult.matchType || 'exact';
+          result.file_path = filePath;
+          result.line_number = extractResult.lineNumber;
+          result.match_line = extractResult.matchLine;
+          matchedFiles++;
+
+          if (onProgress) {
+            await onProgress({
+              type: 'value_extracted',
+              indicator: task.indicator,
+              keyword: searchKey.text,
+              file: filePath,
+              lineNumber: extractResult.lineNumber,
+              line: extractResult.matchLine,
+              checkedFiles,
+              matchedFiles
+            });
+          }
+          break;
+        }
+
+        const words = splitIntoWords(searchKey.text);
+        if (words.length > 1) {
+          extractResult = extractParameterWithWordMatch(filePath, searchKey.text, words, task.indicator);
+
+          if (extractResult.success && extractResult.value) {
+            if (task.dataType === 'number') {
+              const numMatch = String(extractResult.value).match(/-?[\d.]+/);
+              if (numMatch) {
+                result.value = numMatch[0];
+              } else {
+                continue;
+              }
+            } else {
+              result.value = extractResult.value;
+            }
+
+            result.success = true;
+            result.matchedKeyword = searchKey.text;
+            result.matchType = 'partial';
+            result.matchedWord = extractResult.matchedWord || searchKey.text;
+            result.file_path = filePath;
+            result.line_number = extractResult.lineNumber;
+            result.match_line = extractResult.matchLine;
+            matchedFiles++;
+
+            if (onProgress) {
+              await onProgress({
+                type: 'value_extracted',
+                indicator: task.indicator,
+                keyword: searchKey.text,
+                file: filePath,
+                lineNumber: extractResult.lineNumber,
+                line: extractResult.matchLine,
+                matchedWord: result.matchedWord,
+                checkedFiles,
+                matchedFiles
+              });
+            }
+            break;
+          }
+        }
+
+        if (checkedFiles % YIELD_EVERY === 0) {
+          await waitForYield();
+        }
+      }
+
+      results.push(result);
+    }
+  }
+
+  return results;
+}
+
+function findKeywordLine(filePath, keyword) {
+  if (!keyword || !keyword.trim()) return null;
+
+  let lines = null;
+  try {
+    lines = readFileLines(filePath);
+  } catch {
+    return null;
+  }
+
+  const searchText = keyword.trim();
+  const escaped = escapeRegex(searchText);
+  const useWordBoundary = /^[A-Za-z0-9_\s-]+$/.test(searchText);
+  const pattern = useWordBoundary ? new RegExp(`\\b${escaped}\\b`, 'i') : null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const matched = pattern ? pattern.test(line) : line.includes(searchText);
+    if (matched) {
+      return {
+        lineNumber: i + 1,
+        line: truncateLine(line.trim(), searchText)
+      };
+    }
+  }
+
+  return null;
+}
+
 /**
  * 读取文件行（支持多编码）
  */
 function readFileLines(filePath) {
-  const buffer = fs.readFileSync(filePath);
+  const stat = fs.statSync(filePath);
+  const sampleBuffer = readFileSample(filePath, Math.min(stat.size, 4096));
+  if (isProbablyBinary(sampleBuffer)) {
+    throw new Error('跳过二进制文件');
+  }
 
+  let buffer;
+  if (stat.size > LARGE_FILE_THRESHOLD) {
+    const tailSize = Math.min(stat.size, LARGE_FILE_TAIL_BYTES);
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      buffer = Buffer.alloc(tailSize);
+      fs.readSync(fd, buffer, 0, tailSize, stat.size - tailSize);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } else {
+    buffer = fs.readFileSync(filePath);
+  }
+
+  const lines = decodeBufferToLines(buffer);
+  if (stat.size > LARGE_FILE_THRESHOLD && lines.length > LARGE_FILE_MAX_LINES) {
+    return lines.slice(-LARGE_FILE_MAX_LINES);
+  }
+  return lines;
+}
+
+function readFileSample(filePath, size) {
+  if (size <= 0) return Buffer.alloc(0);
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(size);
+    fs.readSync(fd, buffer, 0, size, 0);
+    return buffer;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function isProbablyBinary(buffer) {
+  if (!buffer || buffer.length === 0) return false;
+  let suspicious = 0;
+  for (const byte of buffer) {
+    if (byte === 0) return true;
+    if (byte < 7 || (byte > 14 && byte < 32)) suspicious++;
+  }
+  return suspicious / buffer.length > 0.3;
+}
+
+function decodeBufferToLines(buffer) {
   const encodings = ['utf-8', 'gbk', 'gb2312', 'utf-16le', 'latin-1'];
 
   for (const enc of encodings) {

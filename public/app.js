@@ -5,11 +5,16 @@
 // ============ 状态管理 ============
 const state = {
   selectedDisk: null,
+  selectedDisks: [],
   templateRules: [],
   templateFilename: '',
   devices: [],
   indexBuilt: false,
-  aiLoading: false
+  aiLoading: false,
+  aiAbortController: null,
+  aiFollowBottom: true,
+  scanFollowBottom: true,
+  collectAbortController: null
 };
 
 // ============ DOM 元素 ============
@@ -71,7 +76,7 @@ function renderDiskList(disks) {
     const isSystem = mountPoint === 'C:' || mountPoint === '/' || (mountPoint && mountPoint.startsWith('C'));
     const diskType = disk.type || '本地磁盘';
     return `
-      <div class="disk-item ${state.selectedDisk === mountPoint ? 'selected' : ''}" data-path="${mountPoint}">
+      <div class="disk-item ${state.selectedDisks.includes(mountPoint) ? 'selected' : ''}" data-path="${mountPoint}">
         <div class="disk-icon">
           <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
             <rect x="2" y="6" width="20" height="12" rx="2"/>
@@ -98,21 +103,36 @@ function renderDiskList(disks) {
 }
 
 function selectDisk(diskPath) {
-  state.selectedDisk = diskPath;
+  if (state.selectedDisks.includes(diskPath)) {
+    state.selectedDisks = state.selectedDisks.filter(disk => disk !== diskPath);
+  } else {
+    state.selectedDisks.push(diskPath);
+  }
+  state.selectedDisk = state.selectedDisks[0] || null;
+
   $$('.disk-item').forEach(el => {
-    el.classList.toggle('selected', el.dataset.path === diskPath);
+    el.classList.toggle('selected', state.selectedDisks.includes(el.dataset.path));
   });
 
-  $('#infoDisk').textContent = diskPath;
-  $('#btnBuildIndex').disabled = false;
+  const diskText = getSelectedDiskText();
+  $('#infoDisk').textContent = diskText || '未选择';
+  $('#btnBuildIndex').disabled = state.selectedDisks.length === 0;
   updateCollectButton();
-  updateFooterStatus(`已选择磁盘: ${diskPath}`);
+  updateFooterStatus(diskText ? `已选择磁盘: ${diskText}` : '未选择磁盘');
 
   // 更新步骤指示器
   updateStep(2);
 
   // 检查索引状态
-  checkIndexStatus(diskPath);
+  checkSelectedIndexStatus();
+}
+
+function getSelectedDisks() {
+  return state.selectedDisks.length > 0 ? state.selectedDisks : (state.selectedDisk ? [state.selectedDisk] : []);
+}
+
+function getSelectedDiskText() {
+  return getSelectedDisks().join(', ');
 }
 
 function updateStep(currentStep) {
@@ -158,28 +178,57 @@ async function checkIndexStatus(diskRoot) {
   }
 }
 
+async function checkSelectedIndexStatus() {
+  const disks = getSelectedDisks();
+  if (disks.length === 0) return;
+
+  if (disks.length === 1) {
+    await checkIndexStatus(disks[0]);
+    return;
+  }
+
+  const statusEl = $('#indexStatus');
+  const textEl = $('#indexStatusText');
+  statusEl.style.display = 'flex';
+  textEl.textContent = `已选择 ${disks.length} 个磁盘，索引状态将在采集时分别判断`;
+  statusEl.className = 'index-status index-stale';
+  state.indexBuilt = false;
+}
+
 async function buildIndex() {
-  if (!state.selectedDisk) return;
+  const disks = getSelectedDisks();
+  if (disks.length === 0) return;
 
   $('#btnBuildIndex').disabled = true;
   updateFooterStatus('正在构建文件索引...');
-  showProgress(true, '正在扫描磁盘并构建索引...');
+  showProgress(true, `正在为 ${disks.length} 个磁盘构建索引...`);
 
   try {
-    const res = await fetch('/api/v1/index/build', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ diskRoot: state.selectedDisk })
-    });
-    const data = await res.json();
+    let total = 0;
+    let inserted = 0;
+    let updated = 0;
 
-    if (data.success) {
-      state.indexBuilt = true;
-      showToast(`索引构建完成: ${data.stats.total} 个文件, 新增 ${data.stats.inserted}, 更新 ${data.stats.updated}`, 'success');
-      checkIndexStatus(state.selectedDisk);
-    } else {
-      showToast('索引构建失败: ' + data.error, 'error');
+    for (const diskRoot of disks) {
+      updateFooterStatus(`正在构建索引: ${diskRoot}`);
+      const res = await fetch('/api/v1/index/build', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ diskRoot })
+      });
+      const data = await res.json();
+
+      if (!data.success) {
+        throw new Error(`${diskRoot}: ${data.error}`);
+      }
+
+      total += data.stats.total || 0;
+      inserted += data.stats.inserted || 0;
+      updated += data.stats.updated || 0;
     }
+
+    state.indexBuilt = true;
+    showToast(`索引构建完成: ${total} 个文件, 新增 ${inserted}, 更新 ${updated}`, 'success');
+    checkSelectedIndexStatus();
   } catch (e) {
     showToast('索引构建失败: ' + e.message, 'error');
   } finally {
@@ -258,7 +307,8 @@ async function uploadTemplate(file) {
         indicator: r.indicator || '',
         filePattern: r.filePattern || r.file_pattern || '',
         keyword: r.keyword || '',
-        synonyms: Array.isArray(r.synonyms) ? r.synonyms : (r.synonyms ? String(r.synonyms).split(';').map(s => s.trim()) : [])
+        synonyms: Array.isArray(r.synonyms) ? r.synonyms : (r.synonyms ? String(r.synonyms).split(';').map(s => s.trim()) : []),
+        keywordMeaning: r.keywordMeaning || r.keyword_meaning || ''
       }));
       state.templateFilename = data.filename;
       renderTemplatePreview();
@@ -291,7 +341,7 @@ function renderTemplatePreview() {
 
   const tbody = $('#templateTable tbody');
   if (rules.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#888;padding:20px;">暂无规则，点击"+ 添加行"或上传模板</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#888;padding:20px;">暂无规则，点击"+ 添加行"或上传模板</td></tr>';
     return;
   }
 
@@ -302,6 +352,7 @@ function renderTemplatePreview() {
       <td><input type="text" class="rule-input" data-field="filePattern" data-index="${i}" value="${escapeHtml(rule.filePattern || '')}" placeholder="参考文件"></td>
       <td><input type="text" class="rule-input" data-field="keyword" data-index="${i}" value="${escapeHtml(rule.keyword || '')}" placeholder="关键字"></td>
       <td><input type="text" class="rule-input" data-field="synonyms" data-index="${i}" value="${escapeHtml(Array.isArray(rule.synonyms) ? rule.synonyms.join('; ') : (rule.synonyms || ''))}" placeholder="用分号分隔"></td>
+      <td><input type="text" class="rule-input" data-field="keywordMeaning" data-index="${i}" value="${escapeHtml(rule.keywordMeaning || rule.keyword_meaning || '')}" placeholder="中文含义说明，不参与匹配"></td>
       <td><button class="btn-icon btn-delete-rule" data-index="${i}" title="删除此行">✕</button></td>
     </tr>
   `).join('');
@@ -353,7 +404,7 @@ function addRuleRow() {
     return;
   }
   if (!state.templateRules) state.templateRules = [];
-  state.templateRules.push({ indicator: '', filePattern: '', keyword: '', synonyms: [] });
+  state.templateRules.push({ indicator: '', filePattern: '', keyword: '', synonyms: [], keywordMeaning: '' });
   renderTemplatePreview();
   // 聚焦到新增行的指标名称输入框
   const inputs = document.querySelectorAll('#templateTable tbody .rule-input[data-field="indicator"]');
@@ -362,11 +413,15 @@ function addRuleRow() {
 
 // ============ 采集任务 ============
 async function startCollection() {
-  if (!state.selectedDisk || !state.templateRules.length) return;
+  const selectedDisks = getSelectedDisks();
+  if (selectedDisks.length === 0 || !state.templateRules.length) return;
 
   const btn = $('#btnStartCollect');
   const btnAiFill = $('#btnAiFill');
+  const btnStopCollect = $('#btnStopCollect');
+  state.collectAbortController = new AbortController();
   btn.disabled = true;
+  if (btnStopCollect) btnStopCollect.style.display = 'inline-flex';
   if (btnAiFill) btnAiFill.disabled = true; // 采集时禁用AI补全
   showProgress(true, '正在扫描文件并提取参数...');
   updateFooterStatus('采集中...');
@@ -379,7 +434,11 @@ async function startCollection() {
     $('#scanFileCount').textContent = '0';
     $('#scanMatchCount').textContent = '0';
     $('#scanCurrentIndicator').textContent = '-';
+    $('#scanCurrentLevel').textContent = '-';
     $('#scanStatusText').textContent = '连接中...';
+    state.scanFollowBottom = true;
+    const scanBottomBtn = $('#btnScanScrollBottom');
+    if (scanBottomBtn) scanBottomBtn.style.display = 'none';
   }
 
   // 连接 SSE 监听扫描进度
@@ -416,24 +475,58 @@ async function startCollection() {
       
       if (data.type === 'start') {
         $('#scanStatusText').textContent = '扫描中...';
+      } else if (data.type === 'disk_start') {
+        $('#scanCurrentIndicator').textContent = data.diskRoot;
+        addScanFileEntry('', `开始扫描磁盘：${data.diskRoot}`, 'info');
       } else if (data.type === 'rule_start') {
         $('#scanCurrentIndicator').textContent = data.indicator;
-        addScanFileEntry('', `开始扫描指标：${data.indicator}`, 'scanning');
-      } else if (data.type === 'file_scanned') {
-        scannedFileCount++;
-        $('#scanFileCount').textContent = scannedFileCount;
-        if (data.status === 'matched') {
-          matchedFileCount++;
-          $('#scanMatchCount').textContent = matchedFileCount;
-          addScanFileEntry('✅', data.file, 'matched', data.indicator);
+        addScanFileEntry('', `开始扫描指标：${data.indicator}`, 'scanning', data.diskRoot || '');
+      } else if (data.type === 'scan_level_start') {
+        $('#scanCurrentIndicator').textContent = data.indicator;
+        $('#scanCurrentLevel').textContent = data.levelName || data.level || '-';
+        $('#scanStatusText').textContent = `${data.levelName || data.level}...`;
+        addScanFileEntry('', `${data.levelName || data.level}：${data.indicator}`, 'info', data.diskRoot || '');
+      } else if (data.type === 'dir_enter') {
+        $('#scanStatusText').textContent = '扫描目录中...';
+        addScanFileEntry('', `${data.level || ''} 进入目录：${data.dir}`, 'scanning', data.diskRoot || '', true);
+      } else if (data.type === 'file_check') {
+        if (data.checkedFiles !== undefined) {
+          scannedFileCount = Math.max(scannedFileCount, data.checkedFiles);
+          $('#scanFileCount').textContent = scannedFileCount;
         }
+        if (data.target) {
+          addScanFileEntry('', `${data.level || ''} 检查文件：${data.file}`, 'scanning', data.indicator || '', true);
+        }
+      } else if (data.type === 'file_match') {
+        addScanFileEntry('✅', `${data.level || ''} 匹配候选文件：${data.file}`, 'matched', data.indicator || '');
       } else if (data.type === 'full_scan') {
-        addScanFileEntry('📂', `全盘扫描：找到 ${data.totalFiles} 个日志文件`, 'info');
+        addScanFileEntry('📂', `${data.diskRoot || ''} 全盘扫描完成：找到 ${data.totalFiles} 个候选日志文件`, 'info');
+      } else if (data.type === 'rule_candidates') {
+        addScanFileEntry('', `${data.levelName || data.level} 找到 ${data.filesFound} 个候选文件`, data.filesFound > 0 ? 'info' : 'complete', data.indicator || '');
+      } else if (data.type === 'scan_level_complete') {
+        addScanFileEntry(data.hit ? '✅' : '', `${data.levelName || data.level} ${data.hit ? '命中，停止升级' : '未命中，继续下一级'}`, data.hit ? 'matched' : 'info', data.indicator || '');
       } else if (data.type === 'rule_complete') {
-        addScanFileEntry('✔️', `指标 ${data.indicator} 完成，找到 ${data.filesFound} 个文件`, 'complete');
+        addScanFileEntry('✔️', `指标 ${data.indicator} 完成，找到 ${data.filesFound} 个候选文件`, 'complete', data.diskRoot || '');
+      } else if (data.type === 'extract_start') {
+        $('#scanStatusText').textContent = '提取参数中...';
+        addScanFileEntry('', `开始读取候选文件并提取参数：${data.diskRoot}`, 'info');
+      } else if (data.type === 'extract_file') {
+        $('#scanCurrentIndicator').textContent = data.indicator;
+        addScanFileEntry('', `检查关键字「${data.keyword}」：${data.file}`, 'scanning', data.indicator || '');
+      } else if (data.type === 'keyword_hit') {
+        matchedFileCount++;
+        $('#scanMatchCount').textContent = matchedFileCount;
+        const line = data.line ? `，第 ${data.lineNumber || '-'} 行：${data.line}` : '';
+        addScanFileEntry('✅', `命中关键字「${data.keyword}」：${data.file}${line}`, 'matched', data.indicator || '');
+      } else if (data.type === 'value_extracted') {
+        const line = data.line ? `，第 ${data.lineNumber || '-'} 行：${data.line}` : '';
+        addScanFileEntry('✔️', `提取成功「${data.keyword}」：${data.file}${line}`, 'complete', data.indicator || '');
       } else if (data.type === 'scan_complete') {
         $('#scanStatusText').textContent = '扫描完成';
-        addScanFileEntry('', `扫描完成！共扫描 ${data.totalFiles} 个文件`, 'complete');
+        addScanFileEntry('', `扫描和提取完成！共发现 ${data.totalFiles} 个候选文件`, 'complete');
+      } else if (data.type === 'scan_stopped') {
+        $('#scanStatusText').textContent = '已停止';
+        addScanFileEntry('', `采集已停止，已发现 ${data.totalFiles} 个候选文件`, 'info');
       }
     };
 
@@ -441,10 +534,17 @@ async function startCollection() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        diskRoot: state.selectedDisk,
-        rules: state.templateRules,
+        diskRoot: selectedDisks[0],
+        diskRoots: selectedDisks,
+        rules: state.templateRules.map(rule => ({
+          ...rule,
+          keyword: sanitizeEnglishKeyword(rule.keyword),
+          synonyms: sanitizeEnglishKeywordList(rule.synonyms),
+          keywordMeaning: rule.keywordMeaning || rule.keyword_meaning || ''
+        })),
         useIndex: state.indexBuilt
-      })
+      }),
+      signal: state.collectAbortController.signal
     });
     const data = await res.json();
 
@@ -465,9 +565,12 @@ async function startCollection() {
       showToast('采集失败: ' + data.error, 'error');
     }
   } catch (e) {
-    showToast('采集失败: ' + e.message, 'error');
+    const aborted = e.name === 'AbortError';
+    showToast(aborted ? '采集已停止' : '采集失败: ' + e.message, aborted ? 'info' : 'error');
   } finally {
     btn.disabled = false;
+    state.collectAbortController = null;
+    if (btnStopCollect) btnStopCollect.style.display = 'none';
     if (btnAiFill) btnAiFill.disabled = false; // 恢复AI补全按钮
     showProgress(false);
     updateFooterStatus('就绪');
@@ -480,12 +583,13 @@ async function startCollection() {
 }
 
 // 添加扫描文件条目
-function addScanFileEntry(icon, text, type, indicator = '') {
+function addScanFileEntry(icon, text, type, indicator = '', lowPriority = false) {
   const fileList = $('#scanFileList');
   if (!fileList) return;
 
   const entry = document.createElement('div');
   entry.className = `scan-file-entry scan-file-${type}`;
+  if (lowPriority) entry.dataset.lowPriority = '1';
   
   const indicatorLabel = indicator ? `<span class="scan-file-indicator">[${indicator}]</span>` : '';
   entry.innerHTML = `
@@ -494,9 +598,30 @@ function addScanFileEntry(icon, text, type, indicator = '') {
   `;
   
   fileList.appendChild(entry);
+  trimScanFileList(fileList);
   
   // 自动滚动到底部
+  scrollScanProgressToBottom();
+}
+
+function trimScanFileList(fileList) {
+  const maxEntries = 300;
+  while (fileList.children.length > maxEntries) {
+    const removable = fileList.querySelector('[data-low-priority="1"]');
+    (removable || fileList.firstElementChild)?.remove();
+  }
+}
+
+function scrollScanProgressToBottom() {
+  const fileList = $('#scanFileList');
+  const bottomBtn = $('#btnScanScrollBottom');
+  if (!fileList || !state.scanFollowBottom) {
+    if (bottomBtn) bottomBtn.style.display = 'block';
+    return;
+  }
+
   fileList.scrollTop = fileList.scrollHeight;
+  if (bottomBtn) bottomBtn.style.display = 'none';
 }
 
 // 添加 AI 思考过程条目
@@ -515,7 +640,121 @@ function addAiThinkingEntry(icon, text, type) {
   list.appendChild(entry);
   
   // 自动滚动到底部
-  list.scrollTop = list.scrollHeight;
+  scrollAiThinkingToBottom();
+}
+
+function appendAiThinkingDelta(indicator, content) {
+  if (!content) return;
+  const card = ensureAiIndicatorCard(indicator);
+  const rawEl = card.querySelector('.ai-raw-output');
+  rawEl.textContent += content;
+  updateAiSummaryFromRaw(card);
+  scrollAiThinkingToBottom();
+}
+
+function ensureAiIndicatorCard(indicator) {
+  const list = $('#aiThinkingList');
+  const safeKey = makeAiKey(indicator);
+  let card = list.querySelector(`[data-ai-indicator="${safeKey}"]`);
+  if (card) return card;
+
+  card = document.createElement('div');
+  card.className = 'ai-indicator-card status-running';
+  card.dataset.aiIndicator = safeKey;
+  card.innerHTML = `
+    <div class="ai-card-head">
+      <div>
+        <div class="ai-card-title">${escapeHtml(indicator || '未知指标')}</div>
+        <div class="ai-card-subtitle">等待 AI 输出</div>
+      </div>
+      <span class="ai-card-status">分析中</span>
+    </div>
+    <div class="ai-card-summary"></div>
+    <div class="ai-card-fields">
+      <span>参考文件: <b data-ai-field="filePattern">-</b></span>
+      <span>关键字: <b data-ai-field="keyword">-</b></span>
+      <span>备用: <b data-ai-field="synonyms">-</b></span>
+      <span>含义: <b data-ai-field="keywordMeaning">-</b></span>
+    </div>
+    <details class="ai-card-details">
+      <summary>查看完整输出</summary>
+      <pre class="ai-raw-output"></pre>
+    </details>
+  `;
+  list.appendChild(card);
+  return card;
+}
+
+function updateAiIndicatorCard(indicator, status, data = {}) {
+  const card = ensureAiIndicatorCard(indicator);
+  card.classList.remove('status-running', 'status-success', 'status-error', 'status-warning');
+  card.classList.add(`status-${status}`);
+
+  const statusText = {
+    running: '分析中',
+    success: '已完成',
+    error: '失败',
+    warning: '需检查'
+  }[status] || status;
+
+  card.querySelector('.ai-card-status').textContent = statusText;
+  if (data.subtitle) card.querySelector('.ai-card-subtitle').textContent = data.subtitle;
+  if (data.filePattern !== undefined) card.querySelector('[data-ai-field="filePattern"]').textContent = data.filePattern || '-';
+  if (data.keyword !== undefined) card.querySelector('[data-ai-field="keyword"]').textContent = data.keyword || '-';
+  if (data.synonyms !== undefined) card.querySelector('[data-ai-field="synonyms"]').textContent = Array.isArray(data.synonyms) ? data.synonyms.join(', ') || '-' : data.synonyms || '-';
+  if (data.keywordMeaning !== undefined) card.querySelector('[data-ai-field="keywordMeaning"]').textContent = data.keywordMeaning || '-';
+  if (data.message) card.querySelector('.ai-card-summary').textContent = compactAiSummary(data.message);
+  if (data.summary) card.querySelector('.ai-card-summary').textContent = compactAiSummary(data.summary);
+  scrollAiThinkingToBottom();
+}
+
+function updateAiSummaryFromRaw(card) {
+  const raw = card.querySelector('.ai-raw-output').textContent;
+  card.querySelector('.ai-card-summary').textContent = compactAiSummary(raw) || '正在接收模型输出...';
+}
+
+function compactAiSummary(content) {
+  const raw = String(content || '').trim();
+  if (!raw) return '';
+
+  const lines = raw
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .filter(line => !line.startsWith('{') && !line.startsWith('"') && !line.startsWith('}') && !line.startsWith('```'))
+    .map(line => line.replace(/^分析[:：]\s*/, ''))
+    .filter(line => line.length > 0)
+    .slice(0, 3);
+
+  const summary = lines.join('\n') || raw.replace(/\s+/g, ' ');
+  return summary.length > 180 ? `${summary.slice(0, 180)}...` : summary;
+}
+
+function sanitizeEnglishKeyword(value) {
+  const text = String(value || '').trim();
+  if (!text || /[^\x00-\x7F]/.test(text)) return '';
+  return text.replace(/[^A-Za-z0-9_.:\-\s]/g, '').trim();
+}
+
+function sanitizeEnglishKeywordList(value) {
+  const list = Array.isArray(value) ? value : String(value || '').split(/[;,；，]/);
+  return [...new Set(list.map(sanitizeEnglishKeyword).filter(Boolean))];
+}
+
+function makeAiKey(value) {
+  return btoa(unescape(encodeURIComponent(value || 'unknown'))).replace(/=+$/g, '');
+}
+
+function scrollAiThinkingToBottom() {
+  const container = $('.ai-thinking-container');
+  const bottomBtn = $('#btnAiScrollBottom');
+  if (!container || !state.aiFollowBottom) {
+    if (bottomBtn) bottomBtn.style.display = 'block';
+    return;
+  }
+
+  container.scrollTop = container.scrollHeight;
+  if (bottomBtn) bottomBtn.style.display = 'none';
 }
 
 function renderResults(results, scanLog) {
@@ -548,8 +787,7 @@ function renderResults(results, scanLog) {
   let rowNumber = 1;
   tbody.innerHTML = groupedResults.map(group => {
     return group.rows.map((r, idx) => {
-      const statusClass = r.success ? 'status-success' : 'status-fail';
-      const statusText = r.success ? '已采集' : '未找到';
+      const keywordMeaning = r.keywordMeaning || r.keyword_meaning || '';
       
       // 匹配类型标签
       const matchTypeBadge = r.matchType === 'partial' 
@@ -585,7 +823,7 @@ function renderResults(results, scanLog) {
 
       // 指标列：只有第一行显示，后续行留空
       const indicatorCell = idx === 0 
-        ? `<td rowspan="${group.rows.length}" class="indicator-cell"><strong>${r.indicator}</strong></td>`
+        ? `<td rowspan="${group.rows.length}" class="indicator-cell"><strong>${escapeHtml(r.indicator || '')}</strong></td>`
         : '';
 
       // 序号列：只有第一行显示
@@ -596,10 +834,10 @@ function renderResults(results, scanLog) {
         <tr>
           ${numberCell}
           ${indicatorCell}
+          <td class="file-path-full" title="${escapeHtml(r.file_path || '')}">${escapeHtml(r.file_path || '-')}</td>
           <td class="keyword-cell">${keywordDisplay}</td>
+          <td class="keyword-meaning-cell">${keywordMeaning ? escapeHtml(keywordMeaning) : '<span class="text-muted">-</span>'}</td>
           <td class="match-line-cell">${matchLineDisplay}</td>
-          <td class="file-path-full" title="${r.file_path || ''}">${r.file_path || '-'}</td>
-          <td><span class="status-badge ${statusClass}">${statusText}</span></td>
         </tr>
       `;
     }).join('');
@@ -633,7 +871,7 @@ function formatPath(filePath) {
 }
 
 function updateCollectButton() {
-  const canCollect = state.selectedDisk && state.templateRules.length > 0;
+  const canCollect = getSelectedDisks().length > 0 && state.templateRules.length > 0;
   $('#btnStartCollect').disabled = !canCollect;
 }
 
@@ -742,6 +980,7 @@ async function saveExperienceFromModal() {
           filePattern: r.file_pattern || r.filePattern || '',
           keyword: r.keyword,
           synonyms: Array.isArray(r.synonyms) ? r.synonyms.join(';') : (r.synonyms || ''),
+          keywordMeaning: r.keywordMeaning || r.keyword_meaning || '',
           actualPath: r.actualPath || '',
           confidence: r.confidence || 0
         })),
@@ -811,11 +1050,14 @@ async function aiAutoFill() {
 
   // 设置加载状态
   state.aiLoading = true;
+  state.aiAbortController = new AbortController();
   const btn = $('#btnAiFill');
   if (btn) {
     btn.disabled = true;
-    btn.textContent = '⏳ AI 补全中...';
+    btn.textContent = 'AI 补全中...';
   }
+  const btnStop = $('#btnStopAiFill');
+  if (btnStop) btnStop.style.display = 'inline-flex';
   
   // 锁定表格和上传区域
   const templatePreview = $('#templatePreview');
@@ -835,6 +1077,9 @@ async function aiAutoFill() {
     aiThinkingPanel.style.display = 'block';
     $('#aiThinkingList').innerHTML = '';
     $('#aiThinkingStatus').textContent = '连接中...';
+    state.aiFollowBottom = true;
+    const bottomBtn = $('#btnAiScrollBottom');
+    if (bottomBtn) bottomBtn.style.display = 'none';
   }
 
   // 连接 AI 思考过程 SSE
@@ -869,23 +1114,35 @@ async function aiAutoFill() {
         $('#aiThinkingStatus').textContent = '思考中...';
         addAiThinkingEntry('🤖', `开始分析 ${data.message}`, 'info');
       } else if (data.type === 'analyzing') {
-        addAiThinkingEntry('', `分析指标：${data.indicator} (${data.progress})`, 'thinking');
+        $('#aiThinkingStatus').textContent = `正在补全 ${data.progress}：${data.indicator}`;
+        updateAiIndicatorCard(data.indicator, 'running', { subtitle: `第 ${data.progress} 个指标` });
       } else if (data.type === 'thinking') {
-        addAiThinkingEntry('💭', data.message, 'thinking');
+        updateAiIndicatorCard(data.indicator, 'running', { message: data.message });
+      } else if (data.type === 'delta') {
+        appendAiThinkingDelta(data.indicator, data.content);
       } else if (data.type === 'success') {
-        addAiThinkingEntry('✅', `指标 ${data.indicator}: 关键字="${data.keyword}", 备用=[${(data.synonyms || []).join(', ')}]`, 'success');
+        updateAiIndicatorCard(data.indicator, 'success', {
+          subtitle: '补全完成',
+          keyword: data.keyword,
+          synonyms: data.synonyms || [],
+          filePattern: data.filePattern,
+          keywordMeaning: data.keywordMeaning || '',
+          summary: data.summary
+        });
       } else if (data.type === 'warning') {
-        addAiThinkingEntry('⚠️', `指标 ${data.indicator}: ${data.message}`, 'info');
+        updateAiIndicatorCard(data.indicator, 'warning', { subtitle: '需要检查', message: data.message, summary: data.summary });
       } else if (data.type === 'error') {
-        addAiThinkingEntry('❌', `指标 ${data.indicator}: ${data.message}`, 'error');
+        updateAiIndicatorCard(data.indicator, 'error', { subtitle: '补全失败', message: data.message, summary: data.summary });
       } else if (data.type === 'complete') {
         $('#aiThinkingStatus').textContent = '已完成';
-        addAiThinkingEntry('🎉', data.message, 'success');
+        addAiThinkingEntry('🎉', data.message, data.failCount > 0 ? 'info' : 'success');
       }
     };
 
     // 先尝试从经验库匹配
-    const expRes = await fetch(`/api/v1/experience/match?vendor=${vendor}&deviceType=${deviceType}`);
+    const expRes = await fetch(`/api/v1/experience/match?vendor=${encodeURIComponent(vendor)}&deviceType=${encodeURIComponent(deviceType)}`, {
+      signal: state.aiAbortController.signal
+    });
     const expData = await expRes.json();
 
     if (expData.success && expData.records && expData.records.length > 0) {
@@ -895,11 +1152,12 @@ async function aiAutoFill() {
         const matched = matchedRules.find(r => r.indicator === rule.indicator);
         if (matched) {
           return {
-            ...rule,
-            filePattern: rule.filePattern || matched.filePattern || '',
-            keyword: rule.keyword || matched.keyword || '',
-            synonyms: (rule.synonyms && rule.synonyms.length > 0) ? rule.synonyms : (matched.synonyms || [])
-          };
+              ...rule,
+              filePattern: rule.filePattern || matched.filePattern || '',
+              keyword: rule.keyword || sanitizeEnglishKeyword(matched.keyword) || '',
+              synonyms: (rule.synonyms && rule.synonyms.length > 0) ? sanitizeEnglishKeywordList(rule.synonyms) : sanitizeEnglishKeywordList(matched.synonyms || []),
+              keywordMeaning: rule.keywordMeaning || matched.keywordMeaning || matched.keyword_meaning || ''
+            };
         }
         return rule;
       });
@@ -914,6 +1172,7 @@ async function aiAutoFill() {
       const res = await fetch('/api/v1/ai/autofill', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: state.aiAbortController.signal,
         body: JSON.stringify({
           indicators: state.templateRules.map(r => r.indicator),
           vendor,
@@ -932,20 +1191,24 @@ async function aiAutoFill() {
             return {
               ...rule,
               filePattern: rule.filePattern || aiRule.filePattern || aiRule.file_pattern || '',
-              keyword: rule.keyword || aiRule.keyword || '',
-              synonyms: (rule.synonyms && rule.synonyms.length > 0) ? rule.synonyms : (aiRule.synonyms || [])
+              keyword: rule.keyword || sanitizeEnglishKeyword(aiRule.keyword) || '',
+              synonyms: (rule.synonyms && rule.synonyms.length > 0) ? sanitizeEnglishKeywordList(rule.synonyms) : sanitizeEnglishKeywordList(aiRule.synonyms || []),
+              keywordMeaning: rule.keywordMeaning || aiRule.keywordMeaning || aiRule.keyword_meaning || ''
             };
           }
           return rule;
         });
         renderTemplatePreview();
-        showToast(`AI 已补全 ${data.rules.filter(r => r.keyword || r.filePattern).length} 条规则`, 'success');
+        const failCount = data.failures?.length || 0;
+        showToast(`AI 已补全 ${data.rules.filter(r => r.keyword || r.filePattern).length} 条规则，失败 ${failCount} 条`, failCount ? 'warning' : 'success');
       } else {
         showToast('AI 补全失败: ' + data.error, 'error');
       }
     }
   } catch (e) {
-    showToast('AI 补全失败: ' + e.message, 'error');
+    const aborted = e.name === 'AbortError';
+    $('#aiThinkingStatus').textContent = aborted ? '已停止' : '失败';
+    showToast(aborted ? 'AI 补全已停止' : 'AI 补全失败: ' + e.message, aborted ? 'info' : 'error');
   } finally {
     // 关闭 AI SSE 连接
     if (aiThinkingEventSource) {
@@ -953,10 +1216,12 @@ async function aiAutoFill() {
     }
 
     state.aiLoading = false;
+    state.aiAbortController = null;
     if (btn) {
       btn.disabled = false;
-      btn.textContent = '✨ AI智能补全';
+      btn.textContent = 'AI 智能补全';
     }
+    if (btnStop) btnStop.style.display = 'none';
     // 解锁表格和上传区域
     const templatePreview = $('#templatePreview');
     if (templatePreview) templatePreview.style.pointerEvents = '';
@@ -968,7 +1233,7 @@ async function aiAutoFill() {
     // 恢复开始采集按钮
     const btnStartCollect = $('#btnStartCollect');
     if (btnStartCollect) {
-      const canCollect = state.selectedDisk && state.templateRules.length > 0;
+      const canCollect = getSelectedDisks().length > 0 && state.templateRules.length > 0;
       btnStartCollect.disabled = !canCollect;
     }
   }
@@ -994,6 +1259,47 @@ function bindEvents() {
   const btnAiFill = $('#btnAiFill');
   if (btnAiFill) {
     btnAiFill.addEventListener('click', aiAutoFill);
+  }
+
+  const btnStopAiFill = $('#btnStopAiFill');
+  if (btnStopAiFill) {
+    btnStopAiFill.addEventListener('click', stopAiAutoFill);
+  }
+
+  const aiThinkingContainer = $('.ai-thinking-container');
+  if (aiThinkingContainer) {
+    aiThinkingContainer.addEventListener('scroll', () => {
+      const distanceToBottom = aiThinkingContainer.scrollHeight - aiThinkingContainer.scrollTop - aiThinkingContainer.clientHeight;
+      state.aiFollowBottom = distanceToBottom < 80;
+      const bottomBtn = $('#btnAiScrollBottom');
+      if (bottomBtn) bottomBtn.style.display = state.aiFollowBottom ? 'none' : 'block';
+    });
+  }
+
+  const btnAiScrollBottom = $('#btnAiScrollBottom');
+  if (btnAiScrollBottom) {
+    btnAiScrollBottom.addEventListener('click', () => {
+      state.aiFollowBottom = true;
+      scrollAiThinkingToBottom();
+    });
+  }
+
+  const scanFileList = $('#scanFileList');
+  if (scanFileList) {
+    scanFileList.addEventListener('scroll', () => {
+      const distanceToBottom = scanFileList.scrollHeight - scanFileList.scrollTop - scanFileList.clientHeight;
+      state.scanFollowBottom = distanceToBottom < 80;
+      const bottomBtn = $('#btnScanScrollBottom');
+      if (bottomBtn) bottomBtn.style.display = state.scanFollowBottom ? 'none' : 'block';
+    });
+  }
+
+  const btnScanScrollBottom = $('#btnScanScrollBottom');
+  if (btnScanScrollBottom) {
+    btnScanScrollBottom.addEventListener('click', () => {
+      state.scanFollowBottom = true;
+      scrollScanProgressToBottom();
+    });
   }
 
   // 设备型号选择（如果存在）
@@ -1038,6 +1344,11 @@ function bindEvents() {
   // 开始采集
   $('#btnStartCollect').addEventListener('click', startCollection);
 
+  const btnStopCollect = $('#btnStopCollect');
+  if (btnStopCollect) {
+    btnStopCollect.addEventListener('click', stopCollection);
+  }
+
   // 下载结果
   $('#btnDownloadResult').addEventListener('click', () => {
     window.open('/api/v1/result/download', '_blank');
@@ -1046,11 +1357,17 @@ function bindEvents() {
   // AI 引擎切换
   document.querySelectorAll('input[name="aiEngine"]').forEach(radio => {
     radio.addEventListener('change', (e) => {
-      const modelRow = $('#modelSelectRow');
+      const modelSelect = $('#aiModelSelect');
       if (e.target.value === 'deepseek') {
-        modelRow.style.display = 'none';
+        if (modelSelect) {
+          modelSelect.innerHTML = '<option value="deepseek-chat">deepseek-chat</option>';
+          modelSelect.disabled = true;
+        }
       } else {
-        modelRow.style.display = 'flex';
+        if (modelSelect) {
+          modelSelect.disabled = false;
+          modelSelect.innerHTML = '<option value="">加载中...</option>';
+        }
       }
       checkAiStatus();
     });
@@ -1069,31 +1386,56 @@ function bindEvents() {
   });
 }
 
+function stopAiAutoFill() {
+  if (!state.aiLoading || !state.aiAbortController) return;
+  state.aiAbortController.abort();
+  $('#aiThinkingStatus').textContent = '正在停止...';
+}
+
+function stopCollection() {
+  if (!state.collectAbortController) return;
+  state.collectAbortController.abort();
+  $('#scanStatusText').textContent = '正在停止...';
+}
+
 // ==================== AI 功能 ====================
 
 async function checkAiStatus() {
   const dot = $('#aiStatusDot');
   const text = $('#aiStatusText');
+  const selectedBackend = document.querySelector('input[name="aiEngine"]:checked')?.value || 'ollama';
 
   try {
     const res = await fetch('/api/v1/ai/status');
     const data = await res.json();
 
+    if (selectedBackend === 'ollama') {
+      await loadOllamaModels();
+    } else {
+      const select = $('#aiModelSelect');
+      if (select) {
+        select.innerHTML = '<option value="deepseek-chat">deepseek-chat</option>';
+        select.disabled = true;
+      }
+    }
+
     if (dot && text) {
-      if (data.ollama && data.ollama.available) {
+      if (selectedBackend === 'ollama' && data.ollama && data.ollama.available) {
         dot.className = 'status-dot connected';
         text.textContent = 'Ollama 已连接';
-        // 加载 Ollama 本地模型列表
-        loadOllamaModels();
-      } else if (data.deepseek && data.deepseek.available) {
+      } else if (selectedBackend === 'deepseek' && data.deepseek && data.deepseek.available) {
         dot.className = 'status-dot connected';
         text.textContent = 'DeepSeek 已连接';
       } else {
         dot.className = 'status-dot error';
-        text.textContent = 'AI 服务不可用';
+        text.textContent = selectedBackend === 'ollama' ? 'Ollama 不可用' : 'DeepSeek 未配置';
       }
     }
   } catch {
+    const select = $('#aiModelSelect');
+    if (select) {
+      select.innerHTML = '<option value="">无法获取模型状态</option>';
+    }
     if (dot && text) {
       dot.className = 'status-dot error';
       text.textContent = '无法连接 AI 服务';
@@ -1168,7 +1510,8 @@ function showAiError(title, message) {
 
 // AI 参数匹配
 async function handleAiMatch() {
-  if (!state.selectedDisk) {
+  const selectedDisks = getSelectedDisks();
+  if (selectedDisks.length === 0) {
     showToast('请先选择磁盘', 'error');
     return;
   }
@@ -1204,7 +1547,7 @@ async function submitAiMatch() {
       body: JSON.stringify({
         indicator,
         keyword,
-        diskRoot: state.selectedDisk,
+        diskRoot: selectedDisks[0],
         engine: getSelectedEngine(),
         model: getSelectedModel()
       })
@@ -1252,7 +1595,8 @@ async function submitAiMatch() {
 
 // AI 未知参数发现
 async function handleAiDiscover() {
-  if (!state.selectedDisk) {
+  const selectedDisks = getSelectedDisks();
+  if (selectedDisks.length === 0) {
     showToast('请先选择磁盘', 'error');
     return;
   }
@@ -1264,7 +1608,7 @@ async function handleAiDiscover() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        diskRoot: state.selectedDisk,
+        diskRoot: selectedDisks[0],
         engine: getSelectedEngine(),
         model: getSelectedModel()
       })
@@ -1335,7 +1679,7 @@ async function submitAiTemplate() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         userRequest: request,
-        diskRoot: state.selectedDisk,
+        diskRoot: getSelectedDisks()[0] || '',
         engine: getSelectedEngine(),
         model: getSelectedModel()
       })
@@ -1429,7 +1773,8 @@ async function loadExperience(id) {
           filePattern: r.filePattern || r.file_pattern || '',
           keyword: r.keyword,
           // 兼容数组和字符串两种格式
-          synonyms: Array.isArray(r.synonyms) ? r.synonyms : (typeof r.synonyms === 'string' ? r.synonyms.split(';').map(s => s.trim()).filter(Boolean) : [])
+          synonyms: Array.isArray(r.synonyms) ? r.synonyms : (typeof r.synonyms === 'string' ? r.synonyms.split(';').map(s => s.trim()).filter(Boolean) : []),
+          keywordMeaning: r.keywordMeaning || r.keyword_meaning || ''
         }));
         renderTemplatePreview();
         updateStep(2);
@@ -1521,7 +1866,8 @@ async function saveEditedExperience(id) {
       indicator: r.indicator,
       filePattern: r.filePattern,
       keyword: r.keyword,
-      synonyms: r.synonyms || ''
+      synonyms: r.synonyms || '',
+      keywordMeaning: r.keywordMeaning || r.keyword_meaning || ''
     }));
     const updateRes = await fetch(`/api/v1/experience/${id}`, {
       method: 'PUT',
@@ -1578,9 +1924,10 @@ async function saveCurrentAsExperience() {
         model: model || '通用',
         rules: state.templateRules.map(r => ({
           indicator: r.indicator,
-          filePattern: r.file_pattern || '',
+          filePattern: r.file_pattern || r.filePattern || '',
           keyword: r.keyword,
           synonyms: r.synonyms || [],
+          keywordMeaning: r.keywordMeaning || r.keyword_meaning || '',
           actualPath: r.actualPath || '',
           confidence: r.confidence || 0
         })),
@@ -1631,8 +1978,8 @@ async function autoFillFromExperience() {
       for (const match of data.matches) {
         const rule = state.templateRules.find(r => r.indicator === match.indicator);
         if (rule) {
-          if (!rule.file_pattern && match.filePattern) {
-            rule.file_pattern = match.filePattern;
+          if (!rule.filePattern && !rule.file_pattern && match.filePattern) {
+            rule.filePattern = match.filePattern;
             filledCount++;
           }
           if (!rule.keyword && match.keyword) {
@@ -1641,6 +1988,10 @@ async function autoFillFromExperience() {
           }
           if ((!rule.synonyms || rule.synonyms.length === 0) && match.synonyms) {
             rule.synonyms = match.synonyms;
+            filledCount++;
+          }
+          if (!rule.keywordMeaning && (match.keywordMeaning || match.keyword_meaning)) {
+            rule.keywordMeaning = match.keywordMeaning || match.keyword_meaning;
             filledCount++;
           }
         }

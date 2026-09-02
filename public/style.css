@@ -788,10 +788,10 @@ body {
 
 #resultTable th:nth-child(1) { width: 50px; }  /* 序号 */
 #resultTable th:nth-child(2) { width: 120px; } /* 指标 */
-#resultTable th:nth-child(3) { width: 100px; text-align: center; } /* 匹配关键字 */
-#resultTable th:nth-child(4) { width: auto; }  /* 匹配行内容 */
-#resultTable th:nth-child(5) { width: 250px; } /* 文件路径 */
-#resultTable th:nth-child(6) { width: 80px; }  /* 状态 */
+#resultTable th:nth-child(3) { width: 260px; } /* 文件路径 */
+#resultTable th:nth-child(4) { width: 120px; text-align: center; } /* 匹配关键字 */
+#resultTable th:nth-child(5) { width: 220px; } /* 关键字和含义 */
+#resultTable th:nth-child(6) { width: auto; }  /* 匹配行内容 */
 
 /* 指标列样式 */
 .indicator-cell {
@@ -985,6 +985,7 @@ body {
 .scan-file-list {
   max-height: 300px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   border: 1px solid #e2e8f0;
   border-radius: 8px;
   padding: 12px;
@@ -1897,6 +1898,25 @@ body {
   padding: 20px;
   max-height: 400px;
   overflow-y: auto;
+  position: relative;
+  overscroll-behavior: contain;
+}
+
+.scan-progress-container {
+  position: relative;
+}
+
+.scan-scroll-bottom {
+  position: sticky;
+  bottom: 8px;
+  margin-left: auto;
+}
+
+.keyword-meaning-cell {
+  color: #334155;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
 }
 
 .ai-thinking-list {
@@ -1928,6 +1948,7 @@ body {
   color: #334155;
   font-size: 14px;
   line-height: 1.5;
+  white-space: pre-wrap;
 }
 
 .ai-thinking-thinking {
@@ -1949,7 +1970,119 @@ body {
   background: #fef3c7;
   border-left-color: #f59e0b;
 }
-  border-color: #94a3b8;
+
+.ai-indicator-card {
+  padding: 14px 16px;
+  border-radius: 8px;
+  border-left: 3px solid #3b82f6;
+  background: #eff6ff;
+}
+
+.ai-indicator-card.status-success {
+  background: #f0fdf4;
+  border-left-color: #22c55e;
+}
+
+.ai-indicator-card.status-error {
+  background: #fef2f2;
+  border-left-color: #ef4444;
+}
+
+.ai-indicator-card.status-warning {
+  background: #fffbeb;
+  border-left-color: #f59e0b;
+}
+
+.ai-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ai-card-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+.ai-card-subtitle {
+  margin-top: 2px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.ai-card-status {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.08);
+  color: #334155;
+  font-size: 12px;
+}
+
+.ai-card-summary {
+  margin-top: 10px;
+  color: #334155;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  max-height: 110px;
+  overflow: hidden;
+}
+
+.ai-card-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.ai-card-fields b {
+  color: #1e293b;
+  font-weight: 600;
+}
+
+.ai-card-details {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #475569;
+}
+
+.ai-card-details summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.ai-raw-output {
+  margin: 8px 0 0;
+  padding: 10px;
+  max-height: 180px;
+  overflow: auto;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #334155;
+  white-space: pre-wrap;
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ai-scroll-bottom {
+  position: sticky;
+  bottom: 8px;
+  margin-left: auto;
+  display: block;
+  padding: 6px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #334155;
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.12);
 }
 
 /* AI 选择器样式 */

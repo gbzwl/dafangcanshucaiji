@@ -19,8 +19,9 @@ const TARGET_EXTENSIONS = new Set(['.log', '.mrs', '.txt', '.xml']);
  */
 export function normalizePath(p) {
   if (!p) return '';
+  if (/^[a-z]:$/i.test(p)) p += '\\';
   // 检测是否为 Windows 路径（以盘符开头，如 C:\）
-  const isWindowsPath = /^[a-z]:\\/i.test(p) || /\\/.test(p);
+  const isWindowsPath = /^[a-z]:[\\/]/i.test(p) || /\\/.test(p);
   const sep = isWindowsPath ? '\\' : '/';
   let normalized = p.toLowerCase().replace(/[\/\\]/g, sep);
   if (!normalized.endsWith(sep)) normalized += sep;

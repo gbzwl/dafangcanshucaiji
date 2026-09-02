@@ -10,11 +10,39 @@ import { initFileIndex, updateFileIndex, queryFileIndex, isIndexFresh, getIndexS
 const PRESET_DIRS = ['MedCom\\log', 'MedCom/log', 'MriSiteData', 'SysUtil'];
 
 // 目标文件扩展名
-const TARGET_EXTENSIONS = new Set(['.log', '.mrs', '.txt', '.xml']);
+const TARGET_EXTENSIONS = new Set(['.log', '.mrs', '.txt', '.xml', '.csv', '.ini', '.cfg', '.conf']);
+const DEFAULT_EXCLUDE_DIRS = new Set([
+  '$recycle.bin', 'system volume information', 'windows',
+  'program files', 'program files (x86)', 'programdata',
+  'node_modules', '.git', '__pycache__', '.cache',
+  'appdata', 'perflogs', 'msocache', 'intel',
+  'coze', 'versions', 'cache', 'dist', 'build',
+  'resources', 'certs', 'lang'
+]);
 
 // 索引是否已初始化
 let indexInitialized = false;
 let indexDir = null;
+
+const YIELD_EVERY = 50;
+const waitForYield = () => new Promise(resolve => setImmediate(resolve));
+
+function normalizeDiskRoot(diskRoot) {
+  if (/^[a-z]:$/i.test(diskRoot)) return diskRoot + '\\';
+  return diskRoot;
+}
+
+function shouldAbort(options = {}) {
+  return !!options.signal?.aborted;
+}
+
+function getExcludeDirs(options = {}) {
+  return options.excludeDirs || DEFAULT_EXCLUDE_DIRS;
+}
+
+function isTargetFile(filePath) {
+  return TARGET_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
 
 /**
  * 初始化文件索引
@@ -130,6 +158,108 @@ export function scanAllLogFiles(diskRoot, useIndex = true) {
   return directScanAll(diskRoot);
 }
 
+export async function scanAllLogFilesWithProgress(diskRoot, onProgress = null) {
+  diskRoot = normalizeDiskRoot(diskRoot);
+  return scanAllLogFilesWithProgressOptions(diskRoot, onProgress);
+}
+
+export async function scanAllLogFilesWithProgressOptions(diskRoot, onProgress = null, options = {}) {
+  diskRoot = normalizeDiskRoot(diskRoot);
+  const matchedFiles = [];
+  const visitedDirs = new Set();
+  const counters = { checkedFiles: 0, matchedFiles: 0 };
+
+  const excludeDirs = getExcludeDirs(options);
+
+  await walkDirAllWithProgress(diskRoot, matchedFiles, visitedDirs, excludeDirs, onProgress, counters, options);
+  return matchedFiles;
+}
+
+export async function scanReferenceFilesWithProgress(diskRoot, referencePattern, onProgress = null, options = {}) {
+  diskRoot = normalizeDiskRoot(diskRoot);
+  const files = [];
+  const visitedDirs = new Set();
+  const counters = { checkedFiles: 0, matchedFiles: 0 };
+  const references = splitPatterns(referencePattern);
+
+  for (const ref of references) {
+    if (shouldAbort(options)) break;
+    const targetPath = path.isAbsolute(ref) ? ref : path.join(diskRoot, ref);
+
+    if (!fs.existsSync(targetPath)) continue;
+
+    let stat;
+    try {
+      stat = fs.statSync(targetPath);
+    } catch {
+      continue;
+    }
+
+    if (stat.isDirectory()) {
+      await walkDirAllWithProgress(targetPath, files, visitedDirs, getExcludeDirs(options), onProgress, counters, options);
+    } else if (stat.isFile() && isTargetFile(targetPath)) {
+      counters.checkedFiles++;
+      files.push(targetPath);
+      counters.matchedFiles++;
+      if (onProgress) {
+        await onProgress({ type: 'file_check', file: targetPath, checkedFiles: counters.checkedFiles, matchedFiles: counters.matchedFiles, target: true });
+        await onProgress({ type: 'file_match', file: targetPath, checkedFiles: counters.checkedFiles, matchedFiles: counters.matchedFiles });
+      }
+    }
+  }
+
+  return [...new Set(files)];
+}
+
+export async function scanFileGlobsWithProgress(diskRoot, patterns, onProgress = null, options = {}) {
+  diskRoot = normalizeDiskRoot(diskRoot);
+  const files = [];
+  const visitedDirs = new Set();
+  const counters = { checkedFiles: 0, matchedFiles: 0 };
+  const normalizedPatterns = splitPatterns(patterns).map(p => p.replace(/\\/g, '/').toLowerCase());
+
+  if (normalizedPatterns.length === 0) return [];
+
+  await walkDirWithPredicate(diskRoot, files, visitedDirs, getExcludeDirs(options), onProgress, counters, options, (entryName, fullPath) => {
+    if (!isTargetFile(fullPath)) return false;
+    const filename = entryName.toLowerCase();
+    const normalizedPath = fullPath.replace(/\\/g, '/').toLowerCase();
+    return normalizedPatterns.some(pattern => matchFilePattern(filename, normalizedPath, pattern));
+  });
+
+  return [...new Set(files)];
+}
+
+export function buildFileGlobCandidates(rule = {}) {
+  const candidates = [];
+  const filePattern = rule.filePattern || rule.file_pattern || '';
+  for (const pattern of splitPatterns(filePattern)) {
+    if (pattern.includes('*') || pattern.includes('?') || /\.[a-z0-9]{1,8}$/i.test(pattern)) {
+      candidates.push(pattern);
+    }
+  }
+
+  const words = [
+    rule.keyword,
+    ...(Array.isArray(rule.synonyms) ? rule.synonyms : []),
+    rule.indicator
+  ].flatMap(value => String(value || '').split(/[\s_;,./\\:-]+/))
+    .map(value => value.trim())
+    .filter(value => /^[A-Za-z][A-Za-z0-9_-]{2,}$/.test(value));
+
+  for (const word of words.slice(0, 8)) {
+    candidates.push(`*${word}*.log`, `*${word}*.txt`, `*${word}*.csv`);
+  }
+
+  candidates.push('*History*.log', '*Status*.log', '*Event*.log', '*Error*.log', '*Service*.log');
+  return [...new Set(candidates)];
+}
+
+function splitPatterns(value) {
+  const list = Array.isArray(value) ? value : String(value || '').split(',');
+  return list.map(item => String(item || '').trim()).filter(Boolean);
+}
+
 /**
  * 直接扫描磁盘所有日志文件（不使用索引）
  */
@@ -186,6 +316,76 @@ function walkDirAll(dir, results, visited, excludeDirs = null) {
   }
 }
 
+async function walkDirAllWithProgress(dir, results, visited, excludeDirs = null, onProgress = null, counters = null, options = {}) {
+  if (shouldAbort(options) || (options.maxFiles && counters.checkedFiles >= options.maxFiles)) return;
+  const realDir = dir;
+  if (visited.has(realDir)) return;
+  visited.add(realDir);
+
+  if (onProgress) {
+    await onProgress({ type: 'dir_enter', dir, scannedDirs: visited.size });
+  }
+
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    if (onProgress) {
+      await onProgress({ type: 'dir_skip', dir });
+    }
+    return;
+  }
+
+  for (const entry of entries) {
+    const entryName = typeof entry === 'string' ? entry : entry.name;
+    const fullPath = path.join(dir, entryName);
+
+    if (excludeDirs && excludeDirs.has(entryName.toLowerCase())) continue;
+
+    try {
+      const stat = typeof entry === 'string' ? fs.statSync(fullPath) : entry;
+
+      if (stat.isDirectory()) {
+        await walkDirAllWithProgress(fullPath, results, visited, excludeDirs, onProgress, counters, options);
+      } else if (stat.isFile()) {
+        counters.checkedFiles++;
+        const ext = path.extname(entryName).toLowerCase();
+
+        if (onProgress && counters.checkedFiles % (options.progressEvery || 100) === 0) {
+          await onProgress({
+            type: 'file_check',
+            file: fullPath,
+            checkedFiles: counters.checkedFiles,
+            matchedFiles: counters.matchedFiles,
+            target: TARGET_EXTENSIONS.has(ext)
+          });
+        }
+
+        if (TARGET_EXTENSIONS.has(ext)) {
+          results.push(fullPath);
+          counters.matchedFiles++;
+          if (onProgress) {
+            await onProgress({
+              type: 'file_match',
+              file: fullPath,
+              checkedFiles: counters.checkedFiles,
+              matchedFiles: counters.matchedFiles
+            });
+          }
+        }
+
+        if (counters.checkedFiles % YIELD_EVERY === 0) {
+          await waitForYield();
+        }
+
+        if (options.maxFiles && counters.checkedFiles >= options.maxFiles) return;
+      }
+    } catch {
+      // 跳过
+    }
+  }
+}
+
 /**
  * 在指定磁盘根目录下扫描匹配的文件（优先使用索引）
  * @param {string} diskRoot - 磁盘根路径
@@ -209,6 +409,35 @@ export function scanDiskForFiles(diskRoot, filePattern, useIndex = true) {
 
   // 回退到直接扫描
   return directScan(diskRoot, filePattern);
+}
+
+export async function scanDiskForFilesWithProgress(diskRoot, filePattern, onProgress = null) {
+  if (!filePattern || filePattern.trim() === '') {
+    return [];
+  }
+
+  diskRoot = normalizeDiskRoot(diskRoot);
+  const matchedFiles = [];
+  const visitedDirs = new Set();
+  const counters = { checkedFiles: 0, matchedFiles: 0 };
+  const normalizedPattern = filePattern.replace(/\\/g, '/').toLowerCase();
+
+  for (const presetDir of PRESET_DIRS) {
+    const presetPath = path.join(diskRoot, presetDir);
+    if (fs.existsSync(presetPath)) {
+      await walkDirWithProgress(presetPath, normalizedPattern, matchedFiles, visitedDirs, null, onProgress, counters);
+    }
+  }
+
+  const excludeDirs = new Set([
+    '$recycle.bin', 'system volume information', 'windows',
+    'program files', 'program files (x86)', 'programdata',
+    'node_modules', '.git', '__pycache__', '.cache',
+    'appdata', 'perflogs', 'msocache', 'intel'
+  ]);
+
+  await walkDirWithProgress(diskRoot, normalizedPattern, matchedFiles, visitedDirs, excludeDirs, onProgress, counters);
+  return matchedFiles;
 }
 
 /**
@@ -281,6 +510,147 @@ function walkDir(dir, pattern, results, visited, excludeDirs = null) {
   }
 }
 
+async function walkDirWithProgress(dir, pattern, results, visited, excludeDirs = null, onProgress = null, counters = null, options = {}) {
+  const realDir = dir;
+  if (visited.has(realDir)) return;
+  visited.add(realDir);
+
+  if (onProgress) {
+    await onProgress({ type: 'dir_enter', dir, scannedDirs: visited.size });
+  }
+
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    if (onProgress) {
+      await onProgress({ type: 'dir_skip', dir });
+    }
+    return;
+  }
+
+  for (const entry of entries) {
+    const entryName = typeof entry === 'string' ? entry : entry.name;
+    const fullPath = path.join(dir, entryName);
+
+    if (excludeDirs && excludeDirs.has(entryName.toLowerCase())) continue;
+
+    try {
+      const stat = typeof entry === 'string' ? fs.statSync(fullPath) : entry;
+
+      if (stat.isDirectory()) {
+        await walkDirWithProgress(fullPath, pattern, results, visited, excludeDirs, onProgress, counters, options);
+      } else if (stat.isFile()) {
+        counters.checkedFiles++;
+        const ext = path.extname(entryName).toLowerCase();
+
+        if (onProgress && counters.checkedFiles % (options.progressEvery || 100) === 0) {
+          await onProgress({
+            type: 'file_check',
+            file: fullPath,
+            checkedFiles: counters.checkedFiles,
+            matchedFiles: counters.matchedFiles,
+            target: TARGET_EXTENSIONS.has(ext)
+          });
+        }
+
+        if (TARGET_EXTENSIONS.has(ext) && fuzzyMatchFile(entryName, fullPath, pattern)) {
+          results.push(fullPath);
+          counters.matchedFiles++;
+          if (onProgress) {
+            await onProgress({
+              type: 'file_match',
+              file: fullPath,
+              checkedFiles: counters.checkedFiles,
+              matchedFiles: counters.matchedFiles
+            });
+          }
+        }
+
+        if (counters.checkedFiles % YIELD_EVERY === 0) {
+          await waitForYield();
+        }
+      }
+    } catch {
+      // 跳过
+    }
+  }
+}
+
+async function walkDirWithPredicate(dir, results, visited, excludeDirs = null, onProgress = null, counters = null, options = {}, predicate = () => false) {
+  if (shouldAbort(options) || (options.maxFiles && counters.checkedFiles >= options.maxFiles)) return;
+  const realDir = dir;
+  if (visited.has(realDir)) return;
+  visited.add(realDir);
+
+  if (onProgress) {
+    await onProgress({ type: 'dir_enter', dir, scannedDirs: visited.size });
+  }
+
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    if (onProgress) await onProgress({ type: 'dir_skip', dir });
+    return;
+  }
+
+  for (const entry of entries) {
+    if (shouldAbort(options) || (options.maxFiles && counters.checkedFiles >= options.maxFiles)) return;
+
+    const entryName = typeof entry === 'string' ? entry : entry.name;
+    const fullPath = path.join(dir, entryName);
+    if (excludeDirs && excludeDirs.has(entryName.toLowerCase())) continue;
+
+    try {
+      const stat = typeof entry === 'string' ? fs.statSync(fullPath) : entry;
+      if (stat.isDirectory()) {
+        await walkDirWithPredicate(fullPath, results, visited, excludeDirs, onProgress, counters, options, predicate);
+      } else if (stat.isFile()) {
+        counters.checkedFiles++;
+        const target = isTargetFile(fullPath);
+
+        if (onProgress && counters.checkedFiles % (options.progressEvery || 100) === 0) {
+          await onProgress({
+            type: 'file_check',
+            file: fullPath,
+            checkedFiles: counters.checkedFiles,
+            matchedFiles: counters.matchedFiles,
+            target
+          });
+        }
+
+        if (predicate(entryName, fullPath)) {
+          results.push(fullPath);
+          counters.matchedFiles++;
+          if (onProgress) {
+            await onProgress({
+              type: 'file_match',
+              file: fullPath,
+              checkedFiles: counters.checkedFiles,
+              matchedFiles: counters.matchedFiles
+            });
+          }
+        }
+
+        if (counters.checkedFiles % YIELD_EVERY === 0) await waitForYield();
+      }
+    } catch {
+      // 跳过
+    }
+  }
+}
+
+function matchFilePattern(filename, normalizedPath, pattern) {
+  if (pattern.includes('/') && !pattern.includes('*') && !pattern.includes('?')) {
+    return normalizedPath.includes(pattern);
+  }
+  if (pattern.includes('*') || pattern.includes('?')) {
+    return globMatch(filename, path.basename(pattern)) || globMatch(normalizedPath, pattern);
+  }
+  return filename.includes(path.basename(pattern));
+}
+
 /**
  * 模糊匹配文件
  */
@@ -288,6 +658,7 @@ function fuzzyMatchFile(filename, fullPath, pattern) {
   const filenameLower = filename.toLowerCase();
   const fullPathLower = fullPath.toLowerCase().replace(/\\/g, '/');
   const dirLower = path.dirname(fullPathLower);
+  const hasExplicitFile = /\.[a-z0-9]{1,8}$/i.test(pattern) && !pattern.includes('/') && !pattern.includes('\\');
 
   if (pattern.includes('/')) {
     const patternParts = pattern.split('/').filter(Boolean);
@@ -307,6 +678,10 @@ function fuzzyMatchFile(filename, fullPath, pattern) {
 
   if (pattern.includes('*') || pattern.includes('?')) {
     if (globMatch(filenameLower, pattern)) return true;
+  }
+
+  if (hasExplicitFile) {
+    return filenameLower === pattern || filenameLower.includes(pattern);
   }
 
   const patternBase = pattern.replace(/\.[^.]+$/, '');

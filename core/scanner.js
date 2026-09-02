@@ -48,9 +48,10 @@ function getWindowsDisks() {
   // 主要方案：遍历 A-Z 盘符，使用 fs.statfsSync 获取磁盘信息
   for (let i = 65; i <= 90; i++) {
     const letter = String.fromCharCode(i) + ':';
+    const root = letter + '\\';
     try {
-      fs.accessSync(letter + '\\', fs.constants.F_OK);
-      const stats = fs.statfsSync(letter + '\\');
+      fs.accessSync(root, fs.constants.F_OK);
+      const stats = fs.statfsSync(root);
 
       const totalBytes = stats.bsize * stats.blocks;
       const freeBytes = stats.bsize * stats.bfree;
@@ -69,7 +70,7 @@ function getWindowsDisks() {
       }
 
       disks.push({
-        letter,
+        letter: root,
         label,
         type: '本地磁盘',
         totalGB: roundGB(totalBytes),

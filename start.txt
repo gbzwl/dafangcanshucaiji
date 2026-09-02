@@ -1,0 +1,16 @@
+# 1. 删除 lockfile
+del pnpm-lock.yaml
+
+# 2. 重新安装依赖
+pnpm install --no-frozen-lockfile
+
+# 3. 启动服务
+pnpm run dev
+
+
+cd D:\mri-collector
+git init
+git remote add origin https://github.com/gbzwl/dafangcanshucaiji.git
+git pull origin main
+pnpm install --no-frozen-lockfile
+pnpm run dev

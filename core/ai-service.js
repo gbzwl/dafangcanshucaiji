@@ -106,6 +106,134 @@ export async function callAI(prompt, options = {}) {
 }
 
 /**
+ * 流式调用 AI 模型，onToken 会收到模型实时输出片段。
+ */
+export async function callAIStream(prompt, options = {}, onToken = () => {}) {
+  const backend = options.backend || 'ollama';
+  const config = AI_BACKENDS[backend];
+
+  if (backend === 'deepseek' && !process.env.DEEPSEEK_API_KEY) {
+    throw new Error('DeepSeek API 需要设置 DEEPSEEK_API_KEY 环境变量');
+  }
+
+  const controller = new AbortController();
+  let timedOutByIdle = false;
+  let timeoutId = null;
+  const resetIdleTimeout = () => {
+    if (!options.timeout) return;
+    if (timeoutId) clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => {
+      timedOutByIdle = true;
+      controller.abort();
+    }, options.timeout);
+  };
+  resetIdleTimeout();
+  const abortFromCaller = () => controller.abort();
+  if (options.signal) {
+    if (options.signal.aborted) controller.abort();
+    options.signal.addEventListener('abort', abortFromCaller, { once: true });
+  }
+
+  try {
+    let response;
+
+    if (backend === 'ollama') {
+      response = await fetch(`${config.url}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: options.model || config.defaultModel,
+          prompt,
+          stream: true,
+          ...(options.formatJson === false ? {} : { format: 'json' }),
+          options: {
+            temperature: options.temperature ?? 0.3,
+            num_predict: options.maxTokens ?? 2048
+          }
+        }),
+        signal: controller.signal
+      });
+    } else {
+      response = await fetch(`${config.url}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: config.model,
+          messages: [{ role: 'user', content: prompt }],
+          temperature: options.temperature ?? 0.3,
+          max_tokens: options.maxTokens ?? 2048,
+          stream: true
+        }),
+        signal: controller.signal
+      });
+    }
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`AI 请求失败 (${response.status}): ${errorText}`);
+    }
+
+    const decoder = new TextDecoder();
+    let content = '';
+    let buffer = '';
+
+    for await (const chunk of response.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+
+        let token = '';
+        if (backend === 'ollama') {
+          const data = JSON.parse(line);
+          token = data.response || '';
+        } else {
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          const data = JSON.parse(payload);
+          token = data.choices?.[0]?.delta?.content || '';
+        }
+
+        if (token) {
+          content += token;
+          resetIdleTimeout();
+          onToken(token);
+        }
+      }
+    }
+
+    return {
+      content,
+      backend,
+      model: backend === 'ollama' ? (options.model || config.defaultModel) : config.model
+    };
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      if (timedOutByIdle) {
+        throw new Error('AI 长时间没有新输出，已判断为卡住并跳到下一项');
+      }
+      if (options.signal?.aborted) {
+        throw new Error('AI 补全已停止');
+      }
+      throw new Error('AI 请求超时，请检查模型是否正在运行');
+    }
+    throw error;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    if (options.signal) {
+      options.signal.removeEventListener('abort', abortFromCaller);
+    }
+  }
+}
+
+/**
  * 从 AI 响应中提取 JSON
  * @param {string} content - AI 响应文本
  * @returns {object|null} 解析后的 JSON 对象

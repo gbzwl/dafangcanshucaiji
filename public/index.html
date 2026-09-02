@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>大放设备参数采集程序</title>
-  <link rel="stylesheet" href="style.css?v=3.1">
+  <link rel="stylesheet" href="style.css?v=4.0">
 </head>
 <body>
   <div class="app-container">
@@ -156,12 +156,6 @@
             <h3>模板规则预览 <small style="color:#888;font-weight:normal;font-size:12px;">（可直接编辑）</small></h3>
             <div class="preview-actions">
               <button class="btn btn-sm btn-secondary" id="btnAddRule" title="添加一行">+ 添加行</button>
-              <button class="btn btn-sm btn-ai" id="btnAiFill">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/>
-                </svg>
-                AI 智能补全
-              </button>
               <span class="rule-count" id="ruleCount">0 条规则</span>
             </div>
           </div>
@@ -174,6 +168,7 @@
                   <th>参考文件</th>
                   <th>关键字</th>
                   <th>备用关键字</th>
+                  <th>关键字和含义</th>
                   <th width="50">操作</th>
                 </tr>
               </thead>
@@ -219,7 +214,8 @@
               <option value="">加载中...</option>
             </select>
           </div>
-          <button id="btnAiFill" class="btn-primary">✨ AI 智能补全</button>
+          <button id="btnAiFill" class="btn-primary">AI 智能补全</button>
+          <button id="btnStopAiFill" class="btn btn-sm btn-secondary" style="display:none;">停止补全</button>
         </div>
 
         <!-- AI 思考过程 -->
@@ -227,6 +223,7 @@
           <div class="ai-thinking-list" id="aiThinkingList">
             <!-- AI 思考过程将在这里动态添加 -->
           </div>
+          <button class="ai-scroll-bottom" id="btnAiScrollBottom" style="display:none;">回到底部</button>
         </div>
       </section>
 
@@ -262,6 +259,7 @@
             </svg>
             开始采集
           </button>
+          <button class="btn btn-secondary btn-lg" id="btnStopCollect" style="display:none;">停止采集</button>
         </div>
 
         <!-- 进度条 -->
@@ -293,22 +291,27 @@
         <div class="scan-progress-container">
           <div class="scan-stats">
             <div class="scan-stat-item">
-              <span class="scan-stat-label">已扫描文件:</span>
+              <span class="scan-stat-label">已检查文件:</span>
               <span class="scan-stat-value" id="scanFileCount">0</span>
             </div>
             <div class="scan-stat-item">
-              <span class="scan-stat-label">匹配文件:</span>
+              <span class="scan-stat-label">命中文件:</span>
               <span class="scan-stat-value" id="scanMatchCount">0</span>
             </div>
             <div class="scan-stat-item">
               <span class="scan-stat-label">当前指标:</span>
               <span class="scan-stat-value" id="scanCurrentIndicator">-</span>
             </div>
+            <div class="scan-stat-item">
+              <span class="scan-stat-label">当前级别:</span>
+              <span class="scan-stat-value" id="scanCurrentLevel">-</span>
+            </div>
           </div>
 
           <div class="scan-file-list" id="scanFileList">
             <!-- 扫描文件列表将在这里动态添加 -->
           </div>
+          <button class="ai-scroll-bottom scan-scroll-bottom" id="btnScanScrollBottom" style="display:none;">回到底部</button>
         </div>
       </section>
 
@@ -362,10 +365,10 @@
               <tr>
                 <th width="30">#</th>
                 <th>指标</th>
-                <th>匹配关键字</th>
-                <th>匹配行内容</th>
                 <th>文件路径</th>
-                <th>状态</th>
+                <th>匹配关键字</th>
+                <th>关键字和含义</th>
+                <th>匹配行内容</th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -493,6 +496,6 @@
   <!-- Toast 通知 -->
   <div class="toast-container" id="toastContainer"></div>
 
-  <script src="app.js?v=3.1"></script>
+  <script src="app.js?v=4.0"></script>
 </body>
 </html>
