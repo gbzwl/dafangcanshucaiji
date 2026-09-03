@@ -218,6 +218,36 @@
           <button id="btnStopAiFill" class="btn btn-sm btn-secondary" style="display:none;">停止补全</button>
         </div>
 
+        <div class="agent-api-config" id="agentApiConfig">
+          <div class="agent-api-grid">
+            <label class="agent-api-field">
+              <span>API 服务商</span>
+              <select id="agentProvider" class="agent-api-input">
+                <option value="ollama">Ollama 本地</option>
+                <option value="deepseek">DeepSeek</option>
+                <option value="openai">OpenAI</option>
+                <option value="custom">OpenAI 兼容</option>
+              </select>
+            </label>
+            <label class="agent-api-field">
+              <span>Base URL</span>
+              <input id="agentBaseUrl" class="agent-api-input" type="text" placeholder="https://api.deepseek.com">
+            </label>
+            <label class="agent-api-field">
+              <span>模型名称</span>
+              <input id="agentModelName" class="agent-api-input" type="text" placeholder="deepseek-chat">
+            </label>
+            <label class="agent-api-field">
+              <span>API Key</span>
+              <input id="agentApiKey" class="agent-api-input" type="password" placeholder="仅当前会话使用">
+            </label>
+          </div>
+          <div class="agent-api-actions">
+            <button id="btnAgentTest" class="btn btn-sm btn-secondary">测试连接</button>
+            <span id="agentApiStatus" class="scan-status-text">未配置</span>
+          </div>
+        </div>
+
         <!-- AI 思考过程 -->
         <div class="ai-thinking-container">
           <div class="ai-thinking-list" id="aiThinkingList">

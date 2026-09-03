@@ -30,11 +30,34 @@ import {
 } from './core/matcher.js';
 import { extractParameter, batchExtractWithProgress } from './core/extractor.js';
 import { parseTemplate, generateResultExcel, generateTemplateExample } from './core/excel-handler.js';
-import { callAI, callAIStream, checkAIService, getAvailableBackends, extractJSON } from './core/ai-service.js';
+import { callAI, callAIStream, checkAIService, getAvailableBackends, extractJSON, testAIConnection, normalizeAIOptions } from './core/ai-service.js';
 import { aiMatchParameter, aiBatchMatch } from './core/ai-matcher.js';
 import { discoverUnknownParameters, scanLogFiles, extractFieldsFromFile } from './core/ai-discoverer.js';
 import { generateTemplate, saveTemplateToExcel, extractAvailableFields } from './core/ai-template-gen.js';
-import { initExperienceDB, getVendorDevices, saveCollectionRecord, getAllRecords, getRecordDetail, findMatchingRecords, updateRecord, deleteRecord, deleteRecords } from './core/experience-library.js';
+import {
+  initExperienceDB,
+  getVendorDevices,
+  saveCollectionRecord,
+  getAllRecords,
+  getRecordDetail,
+  findMatchingRecords,
+  updateRecord,
+  deleteRecord,
+  deleteRecords,
+  importRawExperienceWorkbook,
+  getRawExperienceRecords,
+  clearRawExperienceRecords,
+  getRawExperienceByIds,
+  saveKnowledgeCandidate,
+  getKnowledgeCandidates,
+  getKnowledgeCandidatesByIds,
+  updateKnowledgeCandidateValidation,
+  deleteKnowledgeCandidate,
+  clearKnowledgeCandidates
+} from './core/experience-library.js';
+import { listTools, executeTool } from './core/tools/agent-tools.js';
+import { validateKnowledgeCandidates } from './core/knowledge-validator.js';
+import { runAgentCollection } from './core/agent-runner.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,7 +77,7 @@ app.use(express.static(path.join(__dirname, 'public'), {
 // 文件上传配置
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }
+  limits: { fileSize: 50 * 1024 * 1024 }
 });
 
 // 目录初始化
@@ -64,6 +87,14 @@ const EXPERIENCE_DIR = path.join(__dirname, 'experiences');
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 if (!fs.existsSync(TEMPLATES_DIR)) fs.mkdirSync(TEMPLATES_DIR, { recursive: true });
 if (!fs.existsSync(EXPERIENCE_DIR)) fs.mkdirSync(EXPERIENCE_DIR, { recursive: true });
+
+let agentRuntimeConfig = {
+  provider: 'ollama',
+  backend: 'ollama',
+  baseUrl: 'http://localhost:11434',
+  model: '',
+  apiKey: ''
+};
 
 // 初始化采集经验库
 initExperienceDB().then(() => {
@@ -124,6 +155,176 @@ async function aiSmartFill(indicator, vendor, deviceType) {
 // ============ API 路由 ============
 
 // 健康检查
+function buildKnowledgeCandidatePrompt(record) {
+  return `你是医疗设备日志采集知识库设计助手。
+请把一条旧采集经验拆解成“候选知识规则”。候选规则只是草稿，后续必须由程序工具验证，不能把样例路径或样例值当成永久固定规则。
+
+原始经验：
+- 厂商：${record.vendor || ''}
+- 设备类型：${record.deviceType || ''}
+- 型号：${record.model || ''}
+- 中文指标名：${record.indicatorName || ''}
+- 指标标识：${record.indicatorCode || ''}
+- 原始文件路径：${record.filePathRaw || ''}
+- 已拆路径片段：${(record.pathFragments || []).join(' | ')}
+- 已拆文件名：${(record.fileNames || []).join(' | ')}
+- 扩展名：${(record.extensions || []).join(' | ')}
+- 关键字及含义/证据摘要：${record.keywordMeaningRaw || ''}
+- 数据来源：${record.dataSourceRaw || ''}
+- 备注：${record.noteRaw || ''}
+
+允许的 ruleType：
+xml_selector, text_keyword, first_last_rows, row_count, column_sum, file_presence, composite_summary, unavailable_reason, unknown
+
+字段说明：
+- filePatterns：去掉盘符后的路径片段或通用路径模式，不要写死盘符。
+- fileNamePatterns：文件名或文件名通配符。
+- keywords：只放真正可能在文件里出现的英文/数字/符号关键字，不要放中文解释。
+- selector：XML/HTML/结构化字段路径，例如 GeneralInfo.SerialNumber。
+- operation：extract_value / search_text / count_rows / first_row / last_row / first_last_rows / sum_column / check_presence / summarize / unavailable。
+- valuePattern：如果适合正则提取，写正则；不确定就留空。
+- meaning：中文说明，说明这个规则为什么可能能采到该指标。
+- evidenceExample：保留原始证据里的关键片段或示例。
+- confidence：0-100，表示候选规则可信度。空路径、空证据、需要外部数据库时应较低。
+- aiReason：简短说明拆解原因和待验证点。
+
+只返回 JSON，不要 Markdown，不要额外解释。格式：
+{
+  "ruleType": "xml_selector",
+  "parserType": "xml",
+  "filePatterns": [],
+  "fileNamePatterns": [],
+  "keywords": [],
+  "selector": "",
+  "operation": "",
+  "valuePattern": "",
+  "meaning": "",
+  "evidenceExample": "",
+  "confidence": 0,
+  "aiReason": ""
+}`;
+}
+
+function normalizeGeneratedCandidate(record, parsed, aiResult = {}) {
+  const filePatterns = normalizeCandidateArray(parsed.filePatterns || parsed.file_patterns || parsed.filePattern);
+  const fileNamePatterns = normalizeCandidateArray(parsed.fileNamePatterns || parsed.file_name_patterns || parsed.fileNamePattern);
+  const keywords = normalizeCandidateKeywords(parsed.keywords || parsed.keywordCandidates || parsed.keyword_candidates || parsed.keyword);
+
+  return {
+    rawExperienceId: record.id,
+    vendor: record.vendor,
+    deviceType: record.deviceType,
+    model: record.model,
+    indicatorName: record.indicatorName,
+    indicatorCode: record.indicatorCode,
+    ruleType: parsed.ruleType || parsed.rule_type || 'unknown',
+    parserType: parsed.parserType || parsed.parser_type || inferParserType(filePatterns, fileNamePatterns),
+    filePatterns: filePatterns.length ? filePatterns : (record.pathFragments || []),
+    fileNamePatterns: fileNamePatterns.length ? fileNamePatterns : (record.fileNames || []),
+    keywords,
+    selector: parsed.selector || '',
+    operation: parsed.operation || '',
+    valuePattern: parsed.valuePattern || parsed.value_pattern || '',
+    meaning: parsed.meaning || '',
+    evidenceExample: parsed.evidenceExample || parsed.evidence_example || record.keywordMeaningRaw || '',
+    aiReason: parsed.aiReason || parsed.ai_reason || parsed.reason || '',
+    confidence: parsed.confidence || 0,
+    status: 'draft',
+    createdBy: `ai:${aiResult.backend || 'unknown'}:${aiResult.model || 'unknown'}`
+  };
+}
+
+function normalizeCandidateArray(value) {
+  const list = Array.isArray(value) ? value : String(value || '').split(/\r?\n|;|；|,/);
+  return [...new Set(list.map(item => String(item || '').trim()).filter(Boolean))].slice(0, 20);
+}
+
+function normalizeCandidateKeywords(value) {
+  return normalizeCandidateArray(value)
+    .filter(item => !/[^\x00-\x7F]/.test(item))
+    .map(item => item.replace(/[^A-Za-z0-9_.:/\\*\-\s]/g, '').trim())
+    .filter(Boolean)
+    .slice(0, 20);
+}
+
+function inferParserType(filePatterns = [], fileNamePatterns = []) {
+  const joined = [...filePatterns, ...fileNamePatterns].join(' ').toLowerCase();
+  if (joined.includes('.xml')) return 'xml';
+  if (joined.includes('.gz')) return 'gzip_text';
+  if (joined.includes('.csv')) return 'csv';
+  if (joined.includes('.tsv')) return 'tsv';
+  if (joined.includes('.htm')) return 'html';
+  if (joined.includes('.ini') || joined.includes('.cfg') || joined.includes('.conf')) return 'key_value';
+  if (joined.includes('.log') || joined.includes('.txt')) return 'text';
+  return '';
+}
+
+function mergeAgentAIOptions(options = {}) {
+  const provider = options.provider || options.backend || agentRuntimeConfig.provider || agentRuntimeConfig.backend || 'ollama';
+  const usesRuntimeKey = !options.apiKey && provider !== 'ollama';
+  return {
+    provider,
+    backend: options.backend || provider,
+    baseUrl: options.baseUrl || agentRuntimeConfig.baseUrl || '',
+    apiKey: options.apiKey || (usesRuntimeKey ? agentRuntimeConfig.apiKey : ''),
+    model: options.model || options.aiModel || agentRuntimeConfig.model || '',
+    timeout: options.timeout,
+    temperature: options.temperature,
+    maxTokens: options.maxTokens
+  };
+}
+
+function normalizeAgentConfigInput(input = {}) {
+  const provider = input.provider || input.backend || 'ollama';
+  const baseUrl = input.baseUrl || input.url || defaultBaseUrl(provider);
+  return {
+    provider,
+    backend: input.backend || provider,
+    baseUrl,
+    model: input.model || input.aiModel || defaultModel(provider),
+    apiKey: input.apiKey || ''
+  };
+}
+
+function publicAgentConfig(config = agentRuntimeConfig) {
+  return {
+    provider: config.provider,
+    backend: config.backend,
+    baseUrl: config.baseUrl,
+    model: config.model,
+    hasApiKey: !!config.apiKey
+  };
+}
+
+function defaultBaseUrl(provider) {
+  const normalized = String(provider || '').toLowerCase();
+  if (normalized === 'deepseek') return 'https://api.deepseek.com';
+  if (normalized === 'openai') return 'https://api.openai.com';
+  if (normalized === 'ollama') return 'http://localhost:11434';
+  return '';
+}
+
+function defaultModel(provider) {
+  const normalized = String(provider || '').toLowerCase();
+  if (normalized === 'deepseek') return 'deepseek-chat';
+  if (normalized === 'openai') return 'gpt-4o-mini';
+  return '';
+}
+
+function normalizeAgentResultsForExcel(results = []) {
+  return results.map(item => ({
+    indicator: item.indicator || '',
+    value: item.value || (item.status === 'success' ? '已采集' : '未找到'),
+    file_path: item.filePath || item.file_path || '',
+    matchedKeyword: item.matchedKeyword || item.matched_keyword || '',
+    keywordMeaning: item.keywordMeaning || item.keyword_meaning || item.reason || '',
+    match_line: item.evidence || item.match_line || '',
+    confidence: item.confidence || 0,
+    matchMethod: `Agent ${item.status || 'unknown'}`,
+    success: item.status === 'success'
+  }));
+}
+
 app.get('/api/v1/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -134,6 +335,360 @@ app.get('/api/v1/health', (req, res) => {
 });
 
 // 获取可用磁盘列表
+app.get('/api/v1/tools', (req, res) => {
+  res.json({ success: true, tools: listTools() });
+});
+
+app.post('/api/v1/tools/:name', async (req, res) => {
+  const result = await executeTool(req.params.name, req.body || {});
+  res.status(result.success === false ? 400 : 200).json(result);
+});
+
+app.get('/api/v1/agent/config', (req, res) => {
+  res.json({ success: true, config: publicAgentConfig(agentRuntimeConfig) });
+});
+
+app.post('/api/v1/agent/config', (req, res) => {
+  try {
+    agentRuntimeConfig = normalizeAgentConfigInput(req.body || {});
+    res.json({
+      success: true,
+      config: publicAgentConfig(agentRuntimeConfig)
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/v1/agent/test', async (req, res) => {
+  try {
+    const input = normalizeAgentConfigInput(req.body || {});
+    const result = await testAIConnection(input);
+    if (result.success) {
+      agentRuntimeConfig = input;
+    }
+    res.json({
+      ...result,
+      config: publicAgentConfig(input)
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/v1/raw-experience/import', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: '未上传文件' });
+    }
+
+    const decodedFilename = iconv.decode(Buffer.from(req.file.originalname, 'latin1'), 'utf8');
+    const result = importRawExperienceWorkbook(req.file.buffer, {
+      vendor: req.body.vendor || '',
+      deviceType: req.body.deviceType || '',
+      model: req.body.model || '',
+      sourceFile: decodedFilename
+    });
+
+    res.json({
+      success: true,
+      filename: decodedFilename,
+      count: result.count,
+      sheets: result.sheets,
+      preview: result.records.slice(0, 20)
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/v1/raw-experience/list', (req, res) => {
+  try {
+    const records = getRawExperienceRecords({
+      vendor: req.query.vendor || '',
+      deviceType: req.query.deviceType || '',
+      model: req.query.model || '',
+      indicator: req.query.indicator || '',
+      limit: req.query.limit || 200
+    });
+    res.json({ success: true, records, count: records.length });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete('/api/v1/raw-experience', (req, res) => {
+  try {
+    clearRawExperienceRecords(req.body || {});
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/v1/knowledge-candidates/generate', async (req, res) => {
+  try {
+    const {
+      rawExperienceIds = [],
+      vendor = '',
+      deviceType = '',
+      model = '',
+      indicator = '',
+      limit = 10,
+      backend = '',
+      provider = '',
+      baseUrl = '',
+      apiKey = '',
+      aiModel = '',
+      modelName = '',
+      dryRun = false,
+      replaceExistingDraft = true
+    } = req.body || {};
+
+    let records = rawExperienceIds.length
+      ? getRawExperienceByIds(rawExperienceIds)
+      : getRawExperienceRecords({ vendor, deviceType, model, indicator, limit });
+
+    records = records.slice(0, Math.max(1, Number(limit) || 10));
+    if (records.length === 0) {
+      return res.status(400).json({ success: false, error: '没有找到可拆解的原始经验记录' });
+    }
+
+    const generated = [];
+    const failures = [];
+    for (const record of records) {
+      try {
+        const prompt = buildKnowledgeCandidatePrompt(record);
+        if (dryRun) {
+          generated.push({ rawExperienceId: record.id, prompt });
+          continue;
+        }
+
+        const aiResult = await callAIStream(
+          prompt,
+          {
+            ...mergeAgentAIOptions({
+              backend,
+              provider,
+              baseUrl,
+              apiKey,
+              model: modelName || aiModel || undefined
+            }),
+            maxTokens: 1200,
+            timeout: 60000,
+            formatJson: false
+          }
+        );
+        const parsed = extractJSON(aiResult.content);
+        if (!parsed) {
+          failures.push({ rawExperienceId: record.id, error: 'AI 未返回有效 JSON' });
+          continue;
+        }
+
+        const candidate = normalizeGeneratedCandidate(record, parsed, aiResult);
+        if (replaceExistingDraft) {
+          clearKnowledgeCandidates({ rawExperienceId: record.id, status: 'draft' });
+        }
+        generated.push(saveKnowledgeCandidate(candidate));
+      } catch (error) {
+        failures.push({ rawExperienceId: record.id, error: error.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      generated,
+      failures,
+      count: generated.length,
+      failCount: failures.length
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/v1/knowledge-candidates/list', (req, res) => {
+  try {
+    const records = getKnowledgeCandidates({
+      vendor: req.query.vendor || '',
+      deviceType: req.query.deviceType || '',
+      model: req.query.model || '',
+      indicator: req.query.indicator || '',
+      status: req.query.status || '',
+      validationStatus: req.query.validationStatus || '',
+      rawExperienceId: req.query.rawExperienceId || '',
+      limit: req.query.limit || 200
+    });
+    res.json({ success: true, records, count: records.length });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/v1/knowledge-candidates/validate', async (req, res) => {
+  try {
+    const {
+      candidateIds = [],
+      candidates = [],
+      roots = [],
+      root = '',
+      maxFiles = 5000,
+      maxResults = 40,
+      topFiles = 10,
+      maxEvidence = 20,
+      writeBack = false
+    } = req.body || {};
+
+    let records = Array.isArray(candidates) && candidates.length ? candidates : [];
+    if (Array.isArray(candidateIds) && candidateIds.length) {
+      records = getKnowledgeCandidatesByIds(candidateIds);
+    }
+
+    if (records.length === 0) {
+      return res.status(400).json({ success: false, error: '没有可验证的候选知识规则' });
+    }
+
+    const rootList = Array.isArray(roots) && roots.length ? roots : (root ? [root] : []);
+    const results = await validateKnowledgeCandidates(records, {
+      roots: rootList,
+      maxFiles,
+      maxResults,
+      topFiles,
+      maxEvidence
+    });
+
+    const updated = [];
+    if (writeBack) {
+      for (const result of results) {
+        if (!result.candidateId) continue;
+        updated.push(updateKnowledgeCandidateValidation(result.candidateId, result));
+      }
+    }
+
+    res.json({
+      success: true,
+      count: results.length,
+      verifiedCount: results.filter(item => item.status === 'verified').length,
+      updatedCount: updated.length,
+      updated,
+      results
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete('/api/v1/knowledge-candidates/:id', (req, res) => {
+  try {
+    deleteKnowledgeCandidate(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete('/api/v1/knowledge-candidates', (req, res) => {
+  try {
+    clearKnowledgeCandidates(req.body || {});
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/v1/agent/collect', async (req, res) => {
+  const requestController = new AbortController();
+  req.on('aborted', () => requestController.abort());
+  res.on('close', () => {
+    if (!res.writableEnded) requestController.abort();
+  });
+
+  try {
+    const body = req.body || {};
+    const roots = body.roots || body.diskRoots || (body.diskRoot ? [body.diskRoot] : []);
+    const indicators = body.indicators || body.rules || [];
+
+    if (!Array.isArray(roots) || roots.length === 0) {
+      return res.status(400).json({ success: false, error: '缺少 roots/diskRoots' });
+    }
+    if (!Array.isArray(indicators) || indicators.length === 0) {
+      return res.status(400).json({ success: false, error: '缺少 indicators/rules' });
+    }
+
+    const aiOptions = mergeAgentAIOptions({
+      provider: body.provider,
+      backend: body.backend,
+      baseUrl: body.baseUrl,
+      apiKey: body.apiKey,
+      model: body.modelName || body.aiModel,
+      temperature: body.temperature,
+      maxTokens: body.maxTokens,
+      timeout: body.timeout
+    });
+    aiOptions.signal = requestController.signal;
+
+    await pushAgentEventNow({
+      type: 'request',
+      message: '收到 Agent 采集请求',
+      roots,
+      indicatorCount: indicators.length,
+      ai: normalizeAIOptions(aiOptions)
+    });
+
+    const result = await runAgentCollection({
+      vendor: body.vendor || '',
+      deviceType: body.deviceType || '',
+      model: body.deviceModel || body.machineModel || body.model || '',
+      roots,
+      indicators,
+      aiOptions,
+      maxSteps: body.maxSteps,
+      maxCandidates: body.maxCandidates,
+      maxResultChars: body.maxResultChars,
+      dryRun: body.dryRun
+    }, {
+      onEvent: event => {
+        if (requestController.signal.aborted) return;
+        pushAgentEvent(event);
+      }
+    });
+
+    const excelResults = normalizeAgentResultsForExcel(result.results);
+    const successCount = excelResults.filter(item => item.success).length;
+    const scanLog = {
+      scan_time: new Date().toLocaleString('zh-CN'),
+      disk: roots.join(', '),
+      total_files: result.toolCalls
+        .filter(call => call.tool === 'search_files')
+        .reduce((sum, call) => sum + (call.result?.checked?.files || 0), 0),
+      success_count: successCount,
+      fail_count: excelResults.length - successCount,
+      total_indicators: excelResults.length,
+      duration: (result.durationMs / 1000).toFixed(2),
+      template_rules: indicators.length,
+      used_index: false,
+      collector: 'agent'
+    };
+
+    if (!body.dryRun) {
+      const outputPath = path.join(TEMP_DIR, 'MRI_Result.xlsx');
+      generateResultExcel(excelResults, scanLog, outputPath);
+    }
+
+    res.json({
+      ...result,
+      scanLog,
+      exportReady: !body.dryRun
+    });
+  } catch (err) {
+    await pushAgentEventNow({
+      type: 'error',
+      message: err.message
+    });
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/api/v1/disks', (req, res) => {
   try {
     const disks = getAvailableDisks();
@@ -415,6 +970,46 @@ function pushAiThinking(data) {
 
 async function pushAiThinkingNow(data) {
   pushAiThinking(data);
+  await waitForFlush();
+}
+
+// ============ Agent 运行过程 SSE ============
+
+let agentStreamClients = [];
+
+app.get('/api/v1/agent/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  res.socket.setNoDelay(true);
+  agentStreamClients.push(res);
+
+  res.write('data: {"type":"init","message":"Agent 流已连接"}\n\n');
+  if (res.flush) res.flush();
+
+  req.on('close', () => {
+    agentStreamClients = agentStreamClients.filter(client => client !== res);
+    console.log('[Agent SSE] 客户端断开连接');
+  });
+});
+
+function pushAgentEvent(data) {
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+  agentStreamClients.forEach(client => {
+    try {
+      client.write(message);
+      if (client.flush) client.flush();
+    } catch (err) {
+      console.error('[Agent SSE] 推送失败', err.message);
+    }
+  });
+}
+
+async function pushAgentEventNow(data) {
+  pushAgentEvent(data);
   await waitForFlush();
 }
 
@@ -705,9 +1300,10 @@ app.get('/api/v1/ai/status', async (req, res) => {
     res.json({
       success: true,
       backends,
+      agentConfig: publicAgentConfig(agentRuntimeConfig),
       ollama: status,
       deepseek: {
-        available: !!process.env.DEEPSEEK_API_KEY,
+        available: !!(process.env.DEEPSEEK_API_KEY || (agentRuntimeConfig.provider === 'deepseek' && agentRuntimeConfig.apiKey)),
         local: false
       }
     });
@@ -715,8 +1311,12 @@ app.get('/api/v1/ai/status', async (req, res) => {
     res.json({
       success: true,
       backends: getAvailableBackends(),
+      agentConfig: publicAgentConfig(agentRuntimeConfig),
       ollama: { available: false, error: err.message },
-      deepseek: { available: !!process.env.DEEPSEEK_API_KEY, local: false }
+      deepseek: {
+        available: !!(process.env.DEEPSEEK_API_KEY || (agentRuntimeConfig.provider === 'deepseek' && agentRuntimeConfig.apiKey)),
+        local: false
+      }
     });
   }
 });
@@ -780,7 +1380,7 @@ app.post('/api/v1/ai/autofill', async (req, res) => {
   });
 
   try {
-    const { indicators, vendor, deviceType, model, backend } = req.body;
+    const { indicators, vendor, deviceType, model, backend, provider, baseUrl, apiKey } = req.body;
 
     if (!indicators || !Array.isArray(indicators) || indicators.length === 0) {
       return res.status(400).json({ success: false, error: '缺少必要参数: indicators' });
@@ -842,10 +1442,15 @@ app.post('/api/v1/ai/autofill', async (req, res) => {
         const aiResult = await callAIStream(
           prompt,
           {
+            ...mergeAgentAIOptions({
+              backend,
+              provider,
+              baseUrl,
+              apiKey,
+              model: model || undefined
+            }),
             timeout: AI_AUTOFILL_ITEM_TIMEOUT,
             maxTokens: AI_AUTOFILL_MAX_TOKENS,
-            model: model || undefined,
-            backend: backend || 'ollama',
             formatJson: false,
             signal: requestController.signal
           },

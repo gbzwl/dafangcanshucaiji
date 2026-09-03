@@ -144,10 +144,10 @@ export function generateResultExcel(results, scanLog, outputPath) {
     resultData.push([
       rowIndex++,
       item.indicator || '',
-      item.file_path || '-',
+      item.file_path || item.filePath || '-',
       item.matchedKeyword || '-',
       item.keywordMeaning || item.keyword_meaning || '-',
-      item.match_line || '-'
+      item.match_line || item.evidence || item.line || '-'
     ]);
   }
 
@@ -175,7 +175,7 @@ export function generateResultExcel(results, scanLog, outputPath) {
   // Sheet 2: 未找到列表
   const missingHeaders = ['指标', '参考文件', '标准关键词', '备用关键词', '关键字和含义', '原因'];
   const missingData = [missingHeaders];
-  const missingItems = results.filter(r => !r.value || r.value === '未找到');
+  const missingItems = results.filter(r => !isSuccessfulResult(r));
 
   for (const item of missingItems) {
     missingData.push([
@@ -211,7 +211,7 @@ export function generateResultExcel(results, scanLog, outputPath) {
   // 统计匹配方式分布
   const methodStats = {};
   for (const r of results) {
-    const method = r.matchMethod || '未匹配';
+    const method = r.matchMethod || r.match_method || r.agentMethod || (r.status ? `Agent ${r.status}` : '未匹配');
     methodStats[method] = (methodStats[method] || 0) + 1;
   }
   for (const [method, count] of Object.entries(methodStats)) {
@@ -223,7 +223,7 @@ export function generateResultExcel(results, scanLog, outputPath) {
   logData.push(['可信度分布', '']);
   const confidenceRanges = { '100%（精确匹配）': 0, '80-99%（高可信）': 0, '60-79%（中可信）': 0, '<60%（低可信）': 0 };
   for (const r of results) {
-    if (!r.value || r.value === '未找到') continue;
+    if (!isSuccessfulResult(r)) continue;
     const c = r.confidence || 0;
     if (c >= 100) confidenceRanges['100%（精确匹配）']++;
     else if (c >= 80) confidenceRanges['80-99%（高可信）']++;
@@ -245,6 +245,14 @@ export function generateResultExcel(results, scanLog, outputPath) {
   }
   const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
   fs.writeFileSync(outputPath, wbout);
+}
+
+function isSuccessfulResult(result) {
+  if (!result) return false;
+  if (result.success === true) return true;
+  if (result.status === 'success' || result.status === 'verified') return true;
+  if (result.value && result.value !== '未找到') return true;
+  return false;
 }
 
 /**

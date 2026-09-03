@@ -14,7 +14,13 @@ const state = {
   aiAbortController: null,
   aiFollowBottom: true,
   scanFollowBottom: true,
-  collectAbortController: null
+  collectAbortController: null,
+  agentConfig: {
+    provider: 'ollama',
+    baseUrl: 'http://localhost:11434',
+    model: '',
+    apiKey: ''
+  }
 };
 
 // ============ DOM 元素 ============
@@ -1167,7 +1173,10 @@ async function aiAutoFill() {
       showToast(`已从经验库补全 ${filledRules.filter(r => r.keyword).length} 条规则`, 'success');
     } else {
       // 无经验记录，使用 AI 生成
-      const selectedModel = $('#aiModelSelect')?.value || '';
+      const agentOptions = getAgentAIOptions();
+      const selectedModel = agentOptions.provider === 'ollama'
+        ? ($('#aiModelSelect')?.value || agentOptions.model || '')
+        : (agentOptions.model || $('#aiModelSelect')?.value || '');
       const selectedBackend = document.querySelector('input[name="aiEngine"]:checked')?.value || 'ollama';
       const res = await fetch('/api/v1/ai/autofill', {
         method: 'POST',
@@ -1178,7 +1187,10 @@ async function aiAutoFill() {
           vendor,
           deviceType,
           model: selectedModel,
-          backend: selectedBackend
+          backend: agentOptions.backend || selectedBackend,
+          provider: agentOptions.provider || selectedBackend,
+          baseUrl: agentOptions.baseUrl || '',
+          apiKey: agentOptions.apiKey || ''
         })
       });
       const data = await res.json();
@@ -1357,6 +1369,11 @@ function bindEvents() {
   // AI 引擎切换
   document.querySelectorAll('input[name="aiEngine"]').forEach(radio => {
     radio.addEventListener('change', (e) => {
+      const provider = $('#agentProvider');
+      if (provider) {
+        provider.value = e.target.value === 'ollama' ? 'ollama' : 'deepseek';
+        applyAgentProviderDefaults(provider.value);
+      }
       const modelSelect = $('#aiModelSelect');
       if (e.target.value === 'deepseek') {
         if (modelSelect) {
@@ -1374,6 +1391,7 @@ function bindEvents() {
   });
 
   // 初始化 AI 状态
+  bindAgentApiConfig();
   checkAiStatus();
 
   // 经验库按钮
@@ -1400,14 +1418,164 @@ function stopCollection() {
 
 // ==================== AI 功能 ====================
 
+function bindAgentApiConfig() {
+  const providerSelect = $('#agentProvider');
+  const baseUrlInput = $('#agentBaseUrl');
+  const modelInput = $('#agentModelName');
+  const apiKeyInput = $('#agentApiKey');
+  const btnTest = $('#btnAgentTest');
+
+  if (!providerSelect || !baseUrlInput || !modelInput || !apiKeyInput) return;
+
+  providerSelect.addEventListener('change', () => {
+    applyAgentProviderDefaults(providerSelect.value);
+    syncAiEngineFromAgentProvider();
+  });
+
+  [baseUrlInput, modelInput, apiKeyInput].forEach(input => {
+    input.addEventListener('input', () => {
+      state.agentConfig = readAgentConfigForm();
+    });
+  });
+
+  if (btnTest) btnTest.addEventListener('click', testAgentConnection);
+  loadAgentConfig();
+}
+
+async function loadAgentConfig() {
+  try {
+    const res = await fetch('/api/v1/agent/config');
+    const data = await res.json();
+    if (data.success && data.config) {
+      state.agentConfig = {
+        ...state.agentConfig,
+        ...data.config,
+        apiKey: ''
+      };
+      renderAgentConfig(data.config);
+      syncAiEngineFromAgentProvider();
+    }
+  } catch {
+    setAgentStatus('配置未加载', 'warning');
+  }
+}
+
+function renderAgentConfig(config = {}) {
+  const provider = $('#agentProvider');
+  const baseUrl = $('#agentBaseUrl');
+  const model = $('#agentModelName');
+  if (provider && config.provider) provider.value = config.provider;
+  if (baseUrl) baseUrl.value = config.baseUrl || defaultAgentBaseUrl(provider?.value);
+  if (model) model.value = config.model || defaultAgentModel(provider?.value);
+  setAgentStatus(config.hasApiKey ? '已配置 Key' : '未配置 Key', config.hasApiKey ? 'success' : 'info');
+}
+
+function readAgentConfigForm() {
+  const provider = $('#agentProvider')?.value || 'ollama';
+  return {
+    provider,
+    backend: provider,
+    baseUrl: $('#agentBaseUrl')?.value.trim() || defaultAgentBaseUrl(provider),
+    model: $('#agentModelName')?.value.trim() || defaultAgentModel(provider),
+    apiKey: $('#agentApiKey')?.value.trim() || ''
+  };
+}
+
+function applyAgentProviderDefaults(provider) {
+  const baseUrl = $('#agentBaseUrl');
+  const model = $('#agentModelName');
+  if (baseUrl) baseUrl.value = defaultAgentBaseUrl(provider);
+  if (model) model.value = defaultAgentModel(provider);
+  state.agentConfig = readAgentConfigForm();
+  setAgentStatus('未测试', 'info');
+}
+
+function syncAiEngineFromAgentProvider() {
+  const provider = $('#agentProvider')?.value || 'ollama';
+  const engine = provider === 'ollama' ? 'ollama' : 'deepseek';
+  const radio = document.querySelector(`input[name="aiEngine"][value="${engine}"]`);
+  if (radio) radio.checked = true;
+}
+
+function getAgentAIOptions() {
+  state.agentConfig = readAgentConfigForm();
+  return state.agentConfig;
+}
+
+async function testAgentConnection() {
+  const btn = $('#btnAgentTest');
+  const config = readAgentConfigForm();
+  state.agentConfig = config;
+
+  if (config.provider !== 'ollama' && !config.apiKey) {
+    setAgentStatus('请先输入 API Key', 'error');
+    showToast('请先输入 API Key', 'warning');
+    return;
+  }
+
+  try {
+    if (btn) btn.disabled = true;
+    setAgentStatus('测试中...', 'info');
+    const res = await fetch('/api/v1/agent/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    });
+    const data = await res.json();
+    if (data.success) {
+      setAgentStatus(`连接成功：${data.model || config.model || config.provider}`, 'success');
+      showToast('API 模型连接成功', 'success');
+      checkAiStatus();
+    } else {
+      setAgentStatus(data.error || '连接失败', 'error');
+      showToast('API 模型连接失败: ' + (data.error || ''), 'error');
+    }
+  } catch (error) {
+    setAgentStatus('连接失败', 'error');
+    showToast('API 模型连接失败: ' + error.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function setAgentStatus(text, type = 'info') {
+  const el = $('#agentApiStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.dataset.status = type;
+}
+
+function defaultAgentBaseUrl(provider) {
+  const map = {
+    ollama: 'http://localhost:11434',
+    deepseek: 'https://api.deepseek.com',
+    openai: 'https://api.openai.com',
+    custom: ''
+  };
+  return map[provider] || '';
+}
+
+function defaultAgentModel(provider) {
+  const map = {
+    deepseek: 'deepseek-chat',
+    openai: 'gpt-4o-mini'
+  };
+  return map[provider] || '';
+}
+
 async function checkAiStatus() {
   const dot = $('#aiStatusDot');
   const text = $('#aiStatusText');
-  const selectedBackend = document.querySelector('input[name="aiEngine"]:checked')?.value || 'ollama';
+  let selectedBackend = document.querySelector('input[name="aiEngine"]:checked')?.value || 'ollama';
 
   try {
     const res = await fetch('/api/v1/ai/status');
     const data = await res.json();
+    if (data.agentConfig) {
+      renderAgentConfig(data.agentConfig);
+      syncAiEngineFromAgentProvider();
+      selectedBackend = document.querySelector('input[name="aiEngine"]:checked')?.value || selectedBackend;
+    }
 
     if (selectedBackend === 'ollama') {
       await loadOllamaModels();
@@ -1423,6 +1591,9 @@ async function checkAiStatus() {
       if (selectedBackend === 'ollama' && data.ollama && data.ollama.available) {
         dot.className = 'status-dot connected';
         text.textContent = 'Ollama 已连接';
+      } else if (selectedBackend !== 'ollama' && data.agentConfig && data.agentConfig.hasApiKey) {
+        dot.className = 'status-dot connected';
+        text.textContent = `${data.agentConfig.provider || 'API'} 已配置`;
       } else if (selectedBackend === 'deepseek' && data.deepseek && data.deepseek.available) {
         dot.className = 'status-dot connected';
         text.textContent = 'DeepSeek 已连接';

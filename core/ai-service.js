@@ -17,6 +17,20 @@ const AI_BACKENDS = {
     timeout: 60000,
     local: false,
     requiresApiKey: true
+  },
+  openai: {
+    url: 'https://api.openai.com',
+    model: 'gpt-4o-mini',
+    timeout: 60000,
+    local: false,
+    requiresApiKey: true
+  },
+  custom: {
+    url: '',
+    model: '',
+    timeout: 60000,
+    local: false,
+    requiresApiKey: false
   }
 };
 
@@ -27,25 +41,20 @@ const AI_BACKENDS = {
  * @returns {Promise<object>} AI 响应
  */
 export async function callAI(prompt, options = {}) {
-  const backend = options.backend || 'ollama';
-  const config = AI_BACKENDS[backend];
-
-  if (backend === 'deepseek' && !process.env.DEEPSEEK_API_KEY) {
-    throw new Error('DeepSeek API 需要设置 DEEPSEEK_API_KEY 环境变量');
-  }
+  const runtime = resolveRuntimeConfig(options);
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), config.timeout);
+  const timeoutId = setTimeout(() => controller.abort(), runtime.timeout);
 
   try {
     let response;
 
-    if (backend === 'ollama') {
-      response = await fetch(`${config.url}/api/generate`, {
+    if (runtime.provider === 'ollama') {
+      response = await fetch(`${runtime.baseUrl}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: options.model || config.defaultModel,
+          model: runtime.model,
           prompt: prompt,
           stream: false,
           format: 'json',
@@ -57,14 +66,11 @@ export async function callAI(prompt, options = {}) {
         signal: controller.signal
       });
     } else {
-      response = await fetch(`${config.url}/v1/chat/completions`, {
+      response = await fetch(getChatCompletionsUrl(runtime.baseUrl), {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`
-        },
+        headers: getApiHeaders(runtime),
         body: JSON.stringify({
-          model: config.model,
+          model: runtime.model,
           messages: [{ role: 'user', content: prompt }],
           temperature: options.temperature ?? 0.3,
           max_tokens: options.maxTokens ?? 2048
@@ -82,7 +88,7 @@ export async function callAI(prompt, options = {}) {
 
     // 解析响应内容
     let content = '';
-    if (backend === 'ollama') {
+    if (runtime.provider === 'ollama') {
       content = data.response || '';
     } else {
       content = data.choices?.[0]?.message?.content || '';
@@ -90,9 +96,11 @@ export async function callAI(prompt, options = {}) {
 
     return {
       content,
+      response: content,
       raw: data,
-      backend,
-      model: backend === 'ollama' ? (options.model || config.defaultModel) : config.model
+      backend: runtime.backend,
+      provider: runtime.provider,
+      model: runtime.model
     };
 
   } catch (error) {
@@ -109,12 +117,7 @@ export async function callAI(prompt, options = {}) {
  * 流式调用 AI 模型，onToken 会收到模型实时输出片段。
  */
 export async function callAIStream(prompt, options = {}, onToken = () => {}) {
-  const backend = options.backend || 'ollama';
-  const config = AI_BACKENDS[backend];
-
-  if (backend === 'deepseek' && !process.env.DEEPSEEK_API_KEY) {
-    throw new Error('DeepSeek API 需要设置 DEEPSEEK_API_KEY 环境变量');
-  }
+  const runtime = resolveRuntimeConfig(options);
 
   const controller = new AbortController();
   let timedOutByIdle = false;
@@ -137,12 +140,12 @@ export async function callAIStream(prompt, options = {}, onToken = () => {}) {
   try {
     let response;
 
-    if (backend === 'ollama') {
-      response = await fetch(`${config.url}/api/generate`, {
+    if (runtime.provider === 'ollama') {
+      response = await fetch(`${runtime.baseUrl}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: options.model || config.defaultModel,
+          model: runtime.model,
           prompt,
           stream: true,
           ...(options.formatJson === false ? {} : { format: 'json' }),
@@ -154,14 +157,11 @@ export async function callAIStream(prompt, options = {}, onToken = () => {}) {
         signal: controller.signal
       });
     } else {
-      response = await fetch(`${config.url}/v1/chat/completions`, {
+      response = await fetch(getChatCompletionsUrl(runtime.baseUrl), {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`
-        },
+        headers: getApiHeaders(runtime),
         body: JSON.stringify({
-          model: config.model,
+          model: runtime.model,
           messages: [{ role: 'user', content: prompt }],
           temperature: options.temperature ?? 0.3,
           max_tokens: options.maxTokens ?? 2048,
@@ -190,7 +190,7 @@ export async function callAIStream(prompt, options = {}, onToken = () => {}) {
         if (!line) continue;
 
         let token = '';
-        if (backend === 'ollama') {
+        if (runtime.provider === 'ollama') {
           const data = JSON.parse(line);
           token = data.response || '';
         } else {
@@ -211,8 +211,10 @@ export async function callAIStream(prompt, options = {}, onToken = () => {}) {
 
     return {
       content,
-      backend,
-      model: backend === 'ollama' ? (options.model || config.defaultModel) : config.model
+      response: content,
+      backend: runtime.backend,
+      provider: runtime.provider,
+      model: runtime.model
     };
   } catch (error) {
     if (error.name === 'AbortError') {
@@ -273,15 +275,15 @@ export function extractJSON(content) {
  * @param {string} backend - 后端类型
  * @returns {Promise<object>} 服务状态
  */
-export async function checkAIService(backend = 'ollama') {
-  const config = AI_BACKENDS[backend];
+export async function checkAIService(backend = 'ollama', options = {}) {
+  const config = AI_BACKENDS[backend] || AI_BACKENDS.custom;
 
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
     if (backend === 'ollama') {
-      const response = await fetch(`${config.url}/api/tags`, {
+      const response = await fetch(`${options.baseUrl || config.url}/api/tags`, {
         signal: controller.signal
       });
 
@@ -298,10 +300,10 @@ export async function checkAIService(backend = 'ollama') {
       }
     } else {
       return {
-        available: !!process.env.DEEPSEEK_API_KEY,
+        available: !!(options.apiKey || getEnvApiKey(backend)),
         backend,
         local: false,
-        message: process.env.DEEPSEEK_API_KEY ? 'API Key 已配置' : '需要设置 DEEPSEEK_API_KEY'
+        message: (options.apiKey || getEnvApiKey(backend)) ? 'API Key 已配置' : '需要配置 API Key'
       };
     }
 
@@ -324,9 +326,127 @@ export async function checkAIService(backend = 'ollama') {
 export function getAvailableBackends() {
   return Object.entries(AI_BACKENDS).map(([key, config]) => ({
     id: key,
-    name: key === 'ollama' ? 'Ollama (本地)' : 'DeepSeek API',
+    name: getBackendName(key),
     local: config.local,
     defaultModel: config.defaultModel || config.model,
     requiresApiKey: config.requiresApiKey || false
   }));
+}
+
+export async function testAIConnection(options = {}) {
+  const runtime = resolveRuntimeConfig({ ...options, maxTokens: options.maxTokens || 24 });
+  if (runtime.provider === 'ollama') {
+    const status = await checkAIService('ollama', { baseUrl: runtime.baseUrl });
+    return {
+      success: status.available,
+      provider: runtime.provider,
+      backend: runtime.backend,
+      model: runtime.model,
+      baseUrl: runtime.baseUrl,
+      message: status.available ? 'Ollama 连接成功' : (status.error || 'Ollama 不可用'),
+      models: status.models || []
+    };
+  }
+
+  const startedAt = Date.now();
+  const result = await callAI('只回复 OK', {
+    ...options,
+    provider: runtime.provider,
+    backend: runtime.backend,
+    baseUrl: runtime.baseUrl,
+    apiKey: runtime.apiKey,
+    model: runtime.model,
+    temperature: 0,
+    maxTokens: 16
+  });
+
+  return {
+    success: true,
+    provider: runtime.provider,
+    backend: runtime.backend,
+    model: runtime.model,
+    baseUrl: runtime.baseUrl,
+    latencyMs: Date.now() - startedAt,
+    message: result.content || '连接成功'
+  };
+}
+
+export function normalizeAIOptions(options = {}) {
+  const runtime = resolveRuntimeConfig(options);
+  return {
+    provider: runtime.provider,
+    backend: runtime.backend,
+    baseUrl: runtime.baseUrl,
+    model: runtime.model,
+    hasApiKey: !!runtime.apiKey,
+    local: runtime.local,
+    timeout: runtime.timeout
+  };
+}
+
+function resolveRuntimeConfig(options = {}) {
+  const backend = options.backend || options.provider || 'ollama';
+  const provider = normalizeProvider(options.provider || backend);
+  const defaults = AI_BACKENDS[provider] || AI_BACKENDS.custom;
+  const baseUrl = trimTrailingSlash(options.baseUrl || options.url || defaults.url);
+  const model = options.model || options.aiModel || defaults.defaultModel || defaults.model;
+  const apiKey = options.apiKey || getEnvApiKey(provider);
+
+  if (provider !== 'ollama' && !baseUrl) {
+    throw new Error('API Base URL 不能为空');
+  }
+  if (provider !== 'ollama' && !model) {
+    throw new Error('模型名称不能为空');
+  }
+  if (defaults.requiresApiKey && !apiKey) {
+    throw new Error(`${getBackendName(provider)} 需要配置 API Key`);
+  }
+
+  return {
+    provider,
+    backend,
+    baseUrl,
+    model,
+    apiKey,
+    timeout: Number(options.timeout || defaults.timeout || 60000),
+    local: !!defaults.local
+  };
+}
+
+function normalizeProvider(value) {
+  const provider = String(value || 'ollama').trim().toLowerCase();
+  if (provider === 'openai-compatible' || provider === 'compatible') return 'custom';
+  if (provider === 'api') return 'custom';
+  return AI_BACKENDS[provider] ? provider : 'custom';
+}
+
+function getEnvApiKey(provider) {
+  if (provider === 'deepseek') return process.env.DEEPSEEK_API_KEY || '';
+  if (provider === 'openai') return process.env.OPENAI_API_KEY || '';
+  return process.env.AI_API_KEY || '';
+}
+
+function getApiHeaders(runtime) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (runtime.apiKey) headers.Authorization = `Bearer ${runtime.apiKey}`;
+  return headers;
+}
+
+function getChatCompletionsUrl(baseUrl) {
+  const clean = trimTrailingSlash(baseUrl);
+  return clean.endsWith('/v1') ? `${clean}/chat/completions` : `${clean}/v1/chat/completions`;
+}
+
+function trimTrailingSlash(value) {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function getBackendName(key) {
+  const names = {
+    ollama: 'Ollama 本地模型',
+    deepseek: 'DeepSeek API',
+    openai: 'OpenAI API',
+    custom: 'OpenAI 兼容 API'
+  };
+  return names[key] || key;
 }
