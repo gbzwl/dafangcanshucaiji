@@ -5,6 +5,7 @@ import { getKnowledgeCandidates } from './experience-library.js';
 
 const ALLOWED_TOOLS = new Set([
   'search_files',
+  'dynamic_scan_plan',
   'get_file_meta',
   'read_head',
   'read_tail',
@@ -40,6 +41,7 @@ export async function runAgentCollection(request = {}, hooks = {}) {
   if (roots.length === 0) throw new Error('roots/diskRoots is required');
   if (indicators.length === 0) throw new Error('indicators/rules is required');
 
+  const startedAt = Date.now();
   const context = {
     vendor: request.vendor || '',
     deviceType: request.deviceType || '',
@@ -49,10 +51,12 @@ export async function runAgentCollection(request = {}, hooks = {}) {
     maxSteps: clampNumber(request.maxSteps, 1, 30, DEFAULT_MAX_STEPS),
     maxCandidates: clampNumber(request.maxCandidates, 0, 30, DEFAULT_MAX_CANDIDATES),
     maxResultChars: clampNumber(request.maxResultChars, 1000, 30000, DEFAULT_MAX_RESULT_CHARS),
+    maxDurationMs: clampNumber(request.maxDurationMs, 10000, 30 * 60 * 1000, 5 * 60 * 1000),
+    agentProfile: String(request.agentProfile || '').trim(),
     dryRun: !!request.dryRun
   };
+  context.deadline = startedAt + context.maxDurationMs;
 
-  const startedAt = Date.now();
   const results = [];
   const trace = [];
   const toolCalls = [];
@@ -65,6 +69,21 @@ export async function runAgentCollection(request = {}, hooks = {}) {
   });
 
   for (let i = 0; i < indicators.length; i++) {
+    if (Date.now() > context.deadline) {
+      results.push(...indicators.slice(i).map(indicator => ({
+        indicator: indicator.indicator,
+        value: '',
+        filePath: '',
+        matchedKeyword: '',
+        keywordMeaning: '',
+        evidence: '',
+        confidence: 0,
+        status: 'failed',
+        reason: 'Agent 任务达到最大时长'
+      })));
+      break;
+    }
+
     const indicator = indicators[i];
     await emit(hooks, trace, {
       type: 'indicator_start',
@@ -117,8 +136,25 @@ export async function runAgentCollection(request = {}, hooks = {}) {
 async function runIndicatorAgent(indicator, candidates, context, hooks, trace, toolCalls) {
   const observations = [];
   let lastModelText = '';
+  let parseErrorCount = 0;
 
   for (let step = 1; step <= context.maxSteps; step++) {
+    if (Date.now() > context.deadline) {
+      return {
+        indicator: indicator.indicator,
+        value: '',
+        filePath: '',
+        matchedKeyword: '',
+        keywordMeaning: '',
+        evidence: '',
+        confidence: 0,
+        status: 'failed',
+        reason: 'Agent 任务达到最大时长',
+        observations: observations.slice(-5),
+        rawModelText: truncate(lastModelText, 2000)
+      };
+    }
+
     await emit(hooks, trace, {
       type: 'model_step',
       indicator: indicator.indicator,
@@ -134,7 +170,7 @@ async function runIndicatorAgent(indicator, candidates, context, hooks, trace, t
         ...context.aiOptions,
         maxTokens: context.aiOptions.maxTokens || DEFAULT_MAX_TOKEN_OUTPUT,
         temperature: context.aiOptions.temperature ?? 0.2,
-        formatJson: false
+        formatJson: context.aiOptions.formatJson ?? true
       },
       token => {
         raw += token;
@@ -148,8 +184,12 @@ async function runIndicatorAgent(indicator, candidates, context, hooks, trace, t
     );
 
     lastModelText = aiResult.content || raw;
-    const action = extractJSON(lastModelText);
+    let action = extractJSON(lastModelText);
     if (!action || typeof action !== 'object') {
+      action = await repairModelAction(lastModelText, indicator, context, hooks, trace, step);
+    }
+    if (!action || typeof action !== 'object') {
+      parseErrorCount++;
       observations.push({
         type: 'parse_error',
         content: truncate(lastModelText, 1200),
@@ -161,11 +201,51 @@ async function runIndicatorAgent(indicator, candidates, context, hooks, trace, t
         step,
         message: '模型没有返回有效 JSON'
       });
+      if (parseErrorCount >= 2) {
+        return {
+          indicator: indicator.indicator,
+          value: '',
+          filePath: '',
+          matchedKeyword: '',
+          keywordMeaning: '',
+          evidence: '',
+          confidence: 0,
+          status: 'failed',
+          reason: '模型连续没有按工具调用 JSON 协议返回，已停止当前指标',
+          observations: observations.slice(-5),
+          rawModelText: truncate(lastModelText, 2000)
+        };
+      }
       continue;
     }
+    parseErrorCount = 0;
 
     if (action.type === 'final') {
       return normalizeFinalResult(indicator, action.result || action, observations);
+    }
+
+    if (action.type === 'tool_request') {
+      await emit(hooks, trace, {
+        type: 'tool_request',
+        indicator: indicator.indicator,
+        step,
+        tool: action.tool || action.name || '',
+        reason: action.reason || action.thought || '',
+        inputSchema: action.input_schema || action.inputSchema || {},
+        expectedOutput: action.expected_output || action.expectedOutput || ''
+      });
+      return {
+        indicator: indicator.indicator,
+        value: '',
+        filePath: '',
+        matchedKeyword: '',
+        keywordMeaning: action.reason || action.thought || '',
+        evidence: '',
+        confidence: 0,
+        status: 'needs_tool',
+        reason: `现有工具不足，需要新增工具：${action.tool || action.name || '未命名工具'}`,
+        toolRequest: action
+      };
     }
 
     if (action.type !== 'tool_call') {
@@ -188,7 +268,7 @@ async function runIndicatorAgent(indicator, candidates, context, hooks, trace, t
       args: redactToolArgs(args)
     });
 
-    const toolResult = await runSafeTool(toolName, args, context);
+    const toolResult = await runSafeTool(toolName, args, context, observations);
     const compactResult = compactToolResult(toolName, toolResult, context.maxResultChars);
     const callRecord = {
       indicator: indicator.indicator,
@@ -226,26 +306,35 @@ async function runIndicatorAgent(indicator, candidates, context, hooks, trace, t
   };
 }
 
-async function runSafeTool(toolName, args, context) {
+async function runSafeTool(toolName, args, context, observations = []) {
   if (!ALLOWED_TOOLS.has(toolName)) {
     return { success: false, error: `tool is not allowed: ${toolName}` };
   }
 
-  const safeArgs = sanitizeToolArgs(toolName, args, context);
+  const safeArgs = sanitizeToolArgs(toolName, args, context, observations);
   if (safeArgs.success === false) return safeArgs;
 
   return executeTool(toolName, safeArgs);
 }
 
-function sanitizeToolArgs(toolName, args = {}, context) {
+function sanitizeToolArgs(toolName, args = {}, context, observations = []) {
   const safe = { ...args };
 
   if (toolName === 'search_files') {
     safe.roots = context.roots;
-    safe.maxFiles = clampNumber(safe.maxFiles, 1, 20000, 5000);
+    safe.maxFiles = clampNumber(safe.maxFiles, 1, 5000, 1200);
     safe.maxResults = clampNumber(safe.maxResults, 1, 200, 50);
-    safe.patterns = normalizeList(safe.patterns || safe.pattern || safe.query).slice(0, 20);
+    safe.patterns = normalizeList(safe.patterns || safe.pattern || safe.query)
+      .map(normalizeSearchPattern)
+      .filter(Boolean)
+      .slice(0, 20);
     safe.extensions = normalizeList(safe.extensions || safe.exts).slice(0, 20);
+    if (safe.patterns.length === 0 && safe.extensions.length === 0) {
+      return {
+        success: false,
+        error: 'search_files 需要提供文件名、路径片段、通配符或扩展名，不能无条件全盘枚举'
+      };
+    }
     delete safe.root;
     delete safe.diskRoot;
     delete safe.diskRoots;
@@ -253,7 +342,13 @@ function sanitizeToolArgs(toolName, args = {}, context) {
   }
 
   if (FILE_ARG_TOOLS.has(toolName)) {
-    const file = safe.file || safe.path;
+    if (toolName === 'search_text') {
+      safe.query = safe.query || safe.keyword || safe.text || safe.content || '';
+      delete safe.text;
+      delete safe.content;
+    }
+
+    const file = safe.file || safe.path || inferFileFromObservations(observations, safe);
     if (!file) return { success: false, error: 'file/path is required' };
     if (!isPathInsideRoots(file, context.roots)) {
       return { success: false, error: 'file path is outside allowed roots' };
@@ -269,18 +364,40 @@ function sanitizeToolArgs(toolName, args = {}, context) {
   return safe;
 }
 
+function inferFileFromObservations(observations = [], args = {}) {
+  const patterns = normalizeList(args.patterns || args.pattern || args.filePattern)
+    .map(normalizeSearchPattern)
+    .filter(Boolean);
+
+  for (const observation of [...observations].reverse()) {
+    const files = observation.result?.files || [];
+    if (!Array.isArray(files) || files.length === 0) continue;
+    if (patterns.length === 0) return files[0].path;
+
+    const matched = files.find(file => {
+      const filePath = String(file.path || '').replace(/\\/g, '/').toLowerCase();
+      const name = String(file.name || '').toLowerCase();
+      return patterns.some(pattern => {
+        const normalized = String(pattern || '').replace(/\\/g, '/').toLowerCase();
+        return filePath.includes(normalized) || name.includes(normalized);
+      });
+    });
+    if (matched) return matched.path;
+  }
+
+  return '';
+}
+
 function buildAgentPrompt(indicator, candidates, context, observations) {
-  return `你是医疗设备日志采集 Agent。你不能直接访问磁盘，只能通过程序工具采集证据。
+  return `${context.agentProfile || '你是医疗设备日志采集 Agent。你不能直接访问磁盘，只能通过程序工具采集证据。'}
 
 任务：
 - 厂商：${context.vendor || '未知'}
 - 设备类型：${context.deviceType || '未知'}
 - 型号：${context.model || '未知'}
 - 当前指标：${indicator.indicator}
-- 指标参考关键字：${indicator.keyword || ''}
-- 指标备用关键字：${normalizeList(indicator.synonyms).join(', ')}
-- 参考文件：${indicator.filePattern || indicator.file_pattern || ''}
-- 关键字和含义：${indicator.keywordMeaning || indicator.keyword_meaning || ''}
+- 指标标识：${indicator.indicatorCode || indicator.indicator_code || ''}
+- 采集任务模板只定义要采集的指标，不预设文件路径和搜索关键字。
 - 允许根目录：${context.roots.join(' | ')}
 
 可用工具：
@@ -299,7 +416,21 @@ ${JSON.stringify(observations.slice(-8), null, 2)}
   "type": "tool_call",
   "thought": "简短说明为什么调用这个工具",
   "tool": "search_files",
-  "args": {}
+  "args": {
+    "patterns": ["文件名或路径片段"],
+    "extensions": [".log", ".xml", ".txt"],
+    "maxFiles": 1200,
+    "maxResults": 30
+  }
+}
+
+如果现有工具不足，返回：
+{
+  "type": "tool_request",
+  "tool": "建议新增的工具名",
+  "reason": "为什么现有工具无法完成",
+  "input_schema": {},
+  "expected_output": "希望工具返回什么"
 }
 
 如果已经可以给出采集结论，返回：
@@ -319,10 +450,61 @@ ${JSON.stringify(observations.slice(-8), null, 2)}
 }
 
 规则：
-- 优先使用知识库候选和模板已有英文关键字。
+- 优先参考知识库候选；如果没有候选，根据中文指标名和指标标识推测英文关键字、文件名和路径片段。
+- 指标标识只是参考线索，不代表日志中一定存在完全相同字段。
 - 日志中一般不会出现中文，搜索关键字必须使用英文、数字或符号。
+- “关键字及含义/证据摘要”属于知识库说明，不要直接整段当作搜索关键字，应从中提炼英文字段、文件名、数值模式或 XML selector。
+- 禁止无条件全盘枚举文件。调用 search_files 时必须提供 patterns 或 extensions，优先用指标标识、知识库文件名、常见日志扩展名缩小范围。
+- 如果需要更灵活的只读探索，优先调用 dynamic_scan_plan，用 pathHints、fileNameHints、contentQueries、includeExtensions 描述扫描计划。
+- 如果 dynamic_scan_plan 和现有工具仍不足，返回 tool_request，不要编造结果。
 - 不要要求读取完整大文件，优先 read_tail/read_sample/search_text/parse_xml。
+- search_files.patterns 使用普通文件名/路径片段/通配符，不是正则；例如写 "package.json" 或 "*.log"，不要写 "package\\.json"。
+- 如果某个工具调用已经返回 0 个结果，不要重复完全相同的 tool_call，应调整文件名、路径片段或直接给出 not_found。
 - 最终结果必须有文件路径和证据；没有证据时 status 应为 "not_found"。`;
+}
+
+async function repairModelAction(rawText, indicator, context, hooks, trace, step) {
+  if ((context.aiOptions.outputMode || 'auto') !== 'auto') return null;
+  if (!rawText || !String(rawText).trim()) return null;
+
+  await emit(hooks, trace, {
+    type: 'parse_repair',
+    indicator: indicator.indicator,
+    step,
+    message: '模型这一步没有按工具格式返回，正在尝试纠正'
+  });
+
+  const repairPrompt = `请把下面模型回复转换成 Agent 决策 JSON。
+只能返回 JSON，不要 Markdown，不要解释。
+允许格式只有三种：
+1. {"type":"tool_call","thought":"","tool":"search_files","args":{}}
+2. {"type":"tool_request","tool":"","reason":"","input_schema":{},"expected_output":""}
+3. {"type":"final","result":{"indicator":"${indicator.indicator}","value":"","filePath":"","matchedKeyword":"","keywordMeaning":"","evidence":"","confidence":0,"status":"not_found","reason":""}}
+
+如果回复中没有明确工具调用或证据结论，返回 not_found。
+
+原始回复：
+${truncate(rawText, 3000)}`;
+
+  try {
+    let repaired = '';
+    const result = await callAIStream(
+      repairPrompt,
+      {
+        ...context.aiOptions,
+        formatJson: true,
+        outputMode: 'strict_json',
+        maxTokens: 800,
+        temperature: 0
+      },
+      token => {
+        repaired += token;
+      }
+    );
+    return extractJSON(result.content || repaired);
+  } catch {
+    return null;
+  }
 }
 
 function loadKnowledgeCandidates(indicator, context) {
@@ -401,6 +583,7 @@ function compactToolResult(toolName, result, maxChars) {
 function summarizeToolResult(toolName, result) {
   if (result.success === false) return result.error || '工具调用失败';
   if (toolName === 'search_files') return `找到 ${result.count || 0} 个文件，检查 ${result.checked?.files || 0} 个文件`;
+  if (toolName === 'dynamic_scan_plan') return `扫描计划找到 ${result.count || 0} 个候选文件，检查 ${result.checked?.files || 0} 个文件`;
   if (toolName === 'search_text') return `命中 ${result.count || 0} 行`;
   if (toolName === 'parse_xml') return `提取 ${result.count || 0} 个 XML 值`;
   if (toolName === 'count_rows') return `行数 ${result.rows || 0}`;
@@ -419,6 +602,7 @@ function normalizeIndicators(value) {
     if (typeof item === 'string') return { indicator: item.trim() };
     return {
       indicator: String(item.indicator || item.name || item.indicatorName || '').trim(),
+      indicatorCode: String(item.indicatorCode || item.indicator_code || item.code || '').trim(),
       keyword: item.keyword || '',
       synonyms: item.synonyms || [],
       filePattern: item.filePattern || item.file_pattern || '',
@@ -437,6 +621,14 @@ function normalizeRoots(value) {
 function normalizeList(value) {
   if (Array.isArray(value)) return value.map(item => String(item || '').trim()).filter(Boolean);
   return String(value || '').split(/\r?\n|;|；|,/).map(item => item.trim()).filter(Boolean);
+}
+
+function normalizeSearchPattern(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\\([.()[\]{}+^$|])/g, '$1')
+    .replace(/^\^/, '')
+    .replace(/\$$/, '');
 }
 
 function isPathInsideRoots(filePath, roots) {

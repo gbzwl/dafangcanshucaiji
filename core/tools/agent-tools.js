@@ -30,6 +30,7 @@ export const toolRegistry = {
   read_tail: readTail,
   read_sample: readSample,
   search_text: searchText,
+  dynamic_scan_plan: dynamicScanPlan,
   parse_xml: parseXml,
   count_rows: countRows,
   first_last_rows: firstLastRows,
@@ -142,6 +143,74 @@ async function searchText(args = {}) {
   return { success: true, file, query, matches, count: matches.length };
 }
 
+async function dynamicScanPlan(args = {}) {
+  const roots = normalizeRoots(args.roots || args.root || args.diskRoots || args.diskRoot);
+  const includeExtensions = normalizeExtensions(args.includeExtensions || args.extensions || ['.log', '.txt', '.xml', '.csv', '.ini', '.cfg', '.conf', '.gz']);
+  const pathHints = normalizeList(args.pathHints || args.path_hints || args.paths || args.patterns);
+  const fileNameHints = normalizeList(args.fileNameHints || args.file_name_hints || args.fileNames);
+  const contentQueries = normalizeList(args.contentQueries || args.content_queries || args.keywords || args.queries);
+  const excludeDirs = new Set([
+    ...DEFAULT_EXCLUDE_DIRS,
+    ...normalizeList(args.excludeDirs || args.exclude_dirs).map(item => item.toLowerCase())
+  ]);
+  const maxFiles = Math.max(1, Math.min(Number(args.maxFiles || args.max_files || 1200), 5000));
+  const maxResults = Math.max(1, Math.min(Number(args.maxResults || args.max_results || 40), 100));
+  const maxFileMB = Math.max(1, Math.min(Number(args.maxFileMB || args.max_file_mb || 50), 200));
+  const candidates = [];
+  const checked = { dirs: 0, files: 0, skippedLarge: 0 };
+
+  for (const root of roots) {
+    await walkFiles(root, async filePath => {
+      checked.files++;
+      const meta = fileMeta(filePath);
+      if (includeExtensions.length && !includeExtensions.includes(meta.ext)) return;
+      if (meta.sizeMB > maxFileMB) {
+        checked.skippedLarge++;
+        return;
+      }
+
+      const normalizedPath = filePath.replace(/\\/g, '/').toLowerCase();
+      const normalizedName = meta.name.toLowerCase();
+      const pathScore = scoreHints(normalizedPath, pathHints);
+      const nameScore = scoreHints(normalizedName, fileNameHints);
+      let contentScore = 0;
+      const evidence = [];
+
+      if (contentQueries.length && (pathScore > 0 || nameScore > 0 || pathHints.length === 0 && fileNameHints.length === 0)) {
+        const found = await findContentEvidence(filePath, contentQueries, 3);
+        contentScore = found.length * 8;
+        evidence.push(...found);
+      }
+
+      const score = pathScore + nameScore + contentScore + recencyScore(meta.modifiedTime);
+      if (score <= 0 && (pathHints.length || fileNameHints.length || contentQueries.length)) return;
+      candidates.push({ ...meta, score, evidence });
+      candidates.sort((a, b) => b.score - a.score);
+      if (candidates.length > maxResults * 3) candidates.length = maxResults * 3;
+    }, {
+      maxFiles,
+      checked,
+      excludeDirs
+    });
+  }
+
+  return {
+    success: true,
+    files: candidates.sort((a, b) => b.score - a.score).slice(0, maxResults),
+    count: Math.min(candidates.length, maxResults),
+    checked,
+    plan: {
+      includeExtensions,
+      pathHints,
+      fileNameHints,
+      contentQueries,
+      maxFiles,
+      maxResults,
+      maxFileMB
+    }
+  };
+}
+
 async function parseXml(args = {}) {
   const file = requireFile(args.file || args.path);
   const selector = String(args.selector || args.pathSelector || args.tag || '').trim();
@@ -226,7 +295,8 @@ async function walkFiles(root, onFile, options = {}) {
       const fullPath = path.join(dir, entry.name);
       const lowerName = entry.name.toLowerCase();
       if (entry.isDirectory()) {
-        if (!DEFAULT_EXCLUDE_DIRS.has(lowerName)) stack.push(fullPath);
+        const excludeDirs = options.excludeDirs || DEFAULT_EXCLUDE_DIRS;
+        if (!excludeDirs.has(lowerName)) stack.push(fullPath);
         continue;
       }
 
@@ -237,6 +307,45 @@ async function walkFiles(root, onFile, options = {}) {
       if (options.maxFiles && options.checked.files >= options.maxFiles) return;
     }
   }
+}
+
+async function findContentEvidence(file, queries, limit) {
+  const matches = [];
+  try {
+    await eachTextLine(file, async (line, lineNumber) => {
+      const lowerLine = String(line || '').toLowerCase();
+      const query = queries.find(item => lowerLine.includes(String(item || '').toLowerCase()));
+      if (query) {
+        matches.push({ query, lineNumber, line: truncate(line.trim(), 300) });
+      }
+      return matches.length < limit;
+    });
+  } catch {
+    return [];
+  }
+  return matches;
+}
+
+function scoreHints(text, hints) {
+  let score = 0;
+  for (const hint of hints) {
+    const normalized = String(hint || '').replace(/\\/g, '/').toLowerCase();
+    if (!normalized) continue;
+    if (text.includes(normalized)) score += 12;
+    for (const part of normalized.split(/[\s_./\\-]+/).filter(item => item.length >= 3)) {
+      if (text.includes(part)) score += 3;
+    }
+  }
+  return score;
+}
+
+function recencyScore(modifiedTime) {
+  const ageDays = (Date.now() - new Date(modifiedTime).getTime()) / 86400000;
+  if (!Number.isFinite(ageDays)) return 0;
+  if (ageDays <= 7) return 4;
+  if (ageDays <= 30) return 2;
+  if (ageDays <= 180) return 1;
+  return 0;
 }
 
 async function readTextHead(file, lineLimit) {
@@ -428,6 +537,7 @@ function escapeRegex(value) {
 function getToolDescription(name) {
   const descriptions = {
     search_files: 'Search files by roots, path/name patterns and extensions.',
+    dynamic_scan_plan: 'Run a safe read-only scan plan with path hints, file name hints, extensions and optional content queries.',
     get_file_meta: 'Return file size, times, extension and normalized path fragment.',
     read_head: 'Read the first N text lines.',
     read_tail: 'Read the last N text lines with large-file protection.',

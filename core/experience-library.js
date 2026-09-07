@@ -195,7 +195,10 @@ export function importRawExperienceWorkbook(buffer, options = {}) {
       for (let i = headerRow + 1; i < rows.length; i++) {
         const row = rows[i] || [];
         const indicatorName = cell(row, columns.indicatorName);
-        const filePathRaw = cell(row, columns.filePath);
+        const filePathRaw = combineDirectoryAndFileName(
+          cell(row, columns.filePath),
+          cell(row, columns.fileName)
+        );
         const keywordMeaningRaw = cell(row, columns.keywordMeaning);
         const indicatorCode = cell(row, columns.indicatorCode);
         const dataSourceRaw = cell(row, columns.dataSource);
@@ -240,6 +243,7 @@ export function importRawExperienceWorkbook(buffer, options = {}) {
           record.dataSourceRaw,
           record.noteRaw
         ]);
+        record.id = db.exec('SELECT last_insert_rowid() as id')[0].values[0][0];
         imported.push(record);
       }
     }
@@ -281,6 +285,14 @@ export function getRawExperienceRecords(filters = {}) {
     query += ' AND (indicator_name LIKE ? OR indicator_code LIKE ?)';
     params.push(`%${filters.indicator}%`, `%${filters.indicator}%`);
   }
+  if (filters.sourceFile) {
+    query += ' AND source_file = ?';
+    params.push(filters.sourceFile);
+  }
+  if (filters.importedAt) {
+    query += ' AND imported_at = ?';
+    params.push(filters.importedAt);
+  }
 
   query += ' ORDER BY imported_at DESC, id DESC';
   if (filters.limit) query += ` LIMIT ${Math.max(1, Number(filters.limit) || 100)}`;
@@ -307,6 +319,14 @@ export function clearRawExperienceRecords(filters = {}) {
     clauses.push('model = ?');
     params.push(filters.model);
   }
+  if (filters.sourceFile) {
+    clauses.push('source_file = ?');
+    params.push(filters.sourceFile);
+  }
+  if (filters.importedAt) {
+    clauses.push('imported_at = ?');
+    params.push(filters.importedAt);
+  }
   const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
   db.run(`DELETE FROM raw_experience${where}`, params);
   saveDB();
@@ -323,6 +343,55 @@ export function getRawExperienceByIds(ids = []) {
   if (result.length === 0) return [];
   const columns = result[0].columns;
   return result[0].values.map(row => mapRawExperienceRow(columns, row));
+}
+
+export function updateRawExperienceRecord(id, updates = {}) {
+  if (!db) throw new Error('经验库未初始化');
+  const recordId = Number(id);
+  if (!Number.isInteger(recordId) || recordId <= 0) {
+    throw new Error('旧表记录 ID 无效');
+  }
+
+  const current = getRawExperienceByIds([recordId])[0];
+  if (!current) throw new Error('旧表记录不存在');
+
+  const next = {
+    indicatorName: updates.indicatorName ?? updates.indicator_name ?? current.indicatorName,
+    indicatorCode: updates.indicatorCode ?? updates.indicator_code ?? current.indicatorCode,
+    filePathRaw: updates.filePathRaw ?? updates.file_path_raw ?? current.filePathRaw,
+    keywordMeaningRaw: updates.keywordMeaningRaw ?? updates.keyword_meaning_raw ?? current.keywordMeaningRaw,
+    dataSourceRaw: updates.dataSourceRaw ?? updates.data_source_raw ?? current.dataSourceRaw,
+    noteRaw: updates.noteRaw ?? updates.note_raw ?? current.noteRaw
+  };
+  const pathInfo = splitExperiencePaths(next.filePathRaw);
+
+  db.run(`
+    UPDATE raw_experience
+    SET indicator_name = ?,
+        indicator_code = ?,
+        file_path_raw = ?,
+        path_fragments = ?,
+        file_names = ?,
+        extensions = ?,
+        keyword_meaning_raw = ?,
+        data_source_raw = ?,
+        note_raw = ?
+    WHERE id = ?
+  `, [
+    String(next.indicatorName || '').trim(),
+    String(next.indicatorCode || '').trim(),
+    String(next.filePathRaw || '').trim(),
+    pathInfo.pathFragments.join('\n'),
+    pathInfo.fileNames.join('\n'),
+    pathInfo.extensions.join('\n'),
+    String(next.keywordMeaningRaw || '').trim(),
+    String(next.dataSourceRaw || '').trim(),
+    String(next.noteRaw || '').trim(),
+    recordId
+  ]);
+
+  saveDB();
+  return getRawExperienceByIds([recordId])[0] || null;
 }
 
 export function saveKnowledgeCandidate(candidate = {}) {
@@ -503,24 +572,96 @@ function findRawExperienceHeader(rows) {
     note: ['备注', '说明']
   };
 
+  aliases.fileName = ['文件名', '文件', '日志文件', '参考文件名', 'file', 'filename', 'file name'];
+  aliases.indicatorName.push('采集参数', '参数', '参数名称', '基础数据指标');
+  aliases.filePath.push('目录路径', '所在目录', '日志目录');
+  aliases.keywordMeaning.push('关键字段及含义', '关键字段和含义', '关键字段说明', '关键字及含义', '关键字和含义', '结果描述', '证据摘要');
+  aliases.indicatorCode.push('英文名', '字段名', '指标英文名', '指标代码');
+
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
     const row = rows[rowIndex].map(value => String(value || '').trim());
     const columns = {};
     for (const [field, names] of Object.entries(aliases)) {
-      const index = row.findIndex(value => names.includes(value));
+      const index = findRawHeaderIndex(row, names, field);
       if (index >= 0) columns[field] = index;
     }
-    if (columns.indicatorName !== undefined && (columns.filePath !== undefined || columns.keywordMeaning !== undefined)) {
+    if (columns.indicatorName !== undefined && (columns.filePath !== undefined || columns.fileName !== undefined || columns.keywordMeaning !== undefined)) {
       return { headerRow: rowIndex, columns };
     }
   }
   return null;
 }
 
+function findRawHeaderIndex(row, aliases, field) {
+  const exactIndex = row.findIndex(value => aliases.includes(value));
+  if (exactIndex >= 0) return exactIndex;
+  return row.findIndex(value => isRawHeaderMatch(value, field));
+}
+
+function isRawHeaderMatch(value, field) {
+  const text = String(value || '').trim().replace(/\s+/g, '').toLowerCase();
+  if (!text) return false;
+
+  if (field === 'indicatorName') {
+    return text.includes('采集参数') || text.includes('基础数据指标') || text === '指标' || text.includes('指标名称') || text.includes('参数名称');
+  }
+  if (field === 'indicatorCode') {
+    return text.includes('指标标识') || text.includes('指标编码') || text.includes('指标代码') || text.includes('英文名') || text.includes('字段名');
+  }
+  if (field === 'filePath') {
+    return text.includes('文件路径') || text === '目录' || text.includes('目录路径') || text.includes('所在目录') || text === '路径';
+  }
+  if (field === 'fileName') {
+    return text === '文件名' || text === '文件' || text.includes('日志文件') || text.includes('参考文件名') || text === 'filename' || text === 'file';
+  }
+  if (field === 'keywordMeaning') {
+    return text.includes('关键字段及含义')
+      || text.includes('关键字段和含义')
+      || text.includes('关键字及含义')
+      || text.includes('关键字和含义')
+      || (text.includes('关键') && (text.includes('含义') || text.includes('说明') || text.includes('描述')))
+      || text.includes('结果描述')
+      || text.includes('证据摘要');
+  }
+  if (field === 'dataSource') {
+    return text.includes('数据来源') || text.includes('采集来源') || text.includes('更新来源');
+  }
+  if (field === 'note') {
+    return text === '备注' || text === '说明';
+  }
+  return false;
+}
+
 function inferDeviceTypeFromSheet(sheetName) {
   const normalized = String(sheetName || '').trim().toUpperCase();
   const knownTypes = ['CT', 'MR', 'MRI', 'DSA', 'DR', 'PET-CT', 'ULTRASOUND'];
   return knownTypes.includes(normalized) ? normalized : '';
+}
+
+function combineDirectoryAndFileName(directoryValue, fileNameValue) {
+  const directory = String(directoryValue || '').trim();
+  const fileName = String(fileNameValue || '').trim();
+  if (!directory) return fileName;
+  if (!fileName) return directory;
+  if (/^[a-z]:[\\/]/i.test(fileName) || fileName.startsWith('\\\\') || fileName.startsWith('/')) {
+    return fileName;
+  }
+
+  return directory
+    .split(/\r?\n|;|；/)
+    .map(dir => dir.trim())
+    .filter(Boolean)
+    .flatMap(dir => fileName
+      .split(/\r?\n|;|；/)
+      .map(name => name.trim())
+      .filter(Boolean)
+      .map(name => {
+        if (dir.endsWith('\\') || dir.endsWith('/')) return `${dir}${name}`;
+        const separator = dir.includes('\\') ? '\\' : '/';
+        return `${dir}${separator}${name}`;
+      })
+    )
+    .join('\n');
 }
 
 function splitExperiencePaths(value) {

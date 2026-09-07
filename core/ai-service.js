@@ -73,7 +73,8 @@ export async function callAI(prompt, options = {}) {
           model: runtime.model,
           messages: [{ role: 'user', content: prompt }],
           temperature: options.temperature ?? 0.3,
-          max_tokens: options.maxTokens ?? 2048
+          max_tokens: options.maxTokens ?? 2048,
+          ...(runtime.responseFormatJson ? { response_format: { type: 'json_object' } } : {})
         }),
         signal: controller.signal
       });
@@ -165,7 +166,8 @@ export async function callAIStream(prompt, options = {}, onToken = () => {}) {
           messages: [{ role: 'user', content: prompt }],
           temperature: options.temperature ?? 0.3,
           max_tokens: options.maxTokens ?? 2048,
-          stream: true
+          stream: true,
+          ...(runtime.responseFormatJson ? { response_format: { type: 'json_object' } } : {})
         }),
         signal: controller.signal
       });
@@ -337,14 +339,48 @@ export async function testAIConnection(options = {}) {
   const runtime = resolveRuntimeConfig({ ...options, maxTokens: options.maxTokens || 24 });
   if (runtime.provider === 'ollama') {
     const status = await checkAIService('ollama', { baseUrl: runtime.baseUrl });
+    const models = status.models || [];
+    if (!status.available) {
+      return {
+        success: false,
+        provider: runtime.provider,
+        backend: runtime.backend,
+        model: runtime.model,
+        baseUrl: runtime.baseUrl,
+        message: status.error || 'Ollama 不可用',
+        models
+      };
+    }
+    if (!runtime.model) {
+      return {
+        success: false,
+        provider: runtime.provider,
+        backend: runtime.backend,
+        model: runtime.model,
+        baseUrl: runtime.baseUrl,
+        message: '请填写 Ollama 本地模型名称',
+        models
+      };
+    }
+    if (models.length && !models.includes(runtime.model)) {
+      return {
+        success: false,
+        provider: runtime.provider,
+        backend: runtime.backend,
+        model: runtime.model,
+        baseUrl: runtime.baseUrl,
+        message: `Ollama 未安装模型 ${runtime.model}`,
+        models
+      };
+    }
     return {
-      success: status.available,
+      success: true,
       provider: runtime.provider,
       backend: runtime.backend,
       model: runtime.model,
       baseUrl: runtime.baseUrl,
-      message: status.available ? 'Ollama 连接成功' : (status.error || 'Ollama 不可用'),
-      models: status.models || []
+      message: 'Ollama 连接成功',
+      models
     };
   }
 
@@ -380,7 +416,8 @@ export function normalizeAIOptions(options = {}) {
     model: runtime.model,
     hasApiKey: !!runtime.apiKey,
     local: runtime.local,
-    timeout: runtime.timeout
+    timeout: runtime.timeout,
+    outputMode: runtime.outputMode
   };
 }
 
@@ -409,7 +446,9 @@ function resolveRuntimeConfig(options = {}) {
     model,
     apiKey,
     timeout: Number(options.timeout || defaults.timeout || 60000),
-    local: !!defaults.local
+    local: !!defaults.local,
+    outputMode: options.outputMode || 'auto',
+    responseFormatJson: options.outputMode === 'strict_json'
   };
 }
 
@@ -434,6 +473,7 @@ function getApiHeaders(runtime) {
 
 function getChatCompletionsUrl(baseUrl) {
   const clean = trimTrailingSlash(baseUrl);
+  if (clean.endsWith('/chat/completions')) return clean;
   return clean.endsWith('/v1') ? `${clean}/chat/completions` : `${clean}/v1/chat/completions`;
 }
 

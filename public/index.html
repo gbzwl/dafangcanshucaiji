@@ -43,7 +43,7 @@
         <div class="step-line"></div>
         <div class="step" data-step="3">
           <div class="step-number">3</div>
-          <span>执行采集</span>
+          <span>Agent采集</span>
         </div>
         <div class="step-line"></div>
         <div class="step" data-step="4">
@@ -146,7 +146,7 @@
             </svg>
           </div>
           <p class="upload-text">拖拽 Excel 文件到此处，或 <span class="upload-link">点击选择文件</span></p>
-          <p class="upload-hint">支持 .xlsx / .xls 格式，至少包含"指标名称"列</p>
+          <p class="upload-hint">支持 .xlsx / .xls 格式，采集任务模板至少包含"指标"列</p>
           <input type="file" id="fileInput" accept=".xlsx,.xls" hidden>
         </div>
 
@@ -164,11 +164,8 @@
               <thead>
                 <tr>
                   <th width="30">#</th>
-                  <th>指标名称</th>
-                  <th>参考文件</th>
-                  <th>关键字</th>
-                  <th>备用关键字</th>
-                  <th>关键字和含义</th>
+                  <th>指标</th>
+                  <th>指标标识</th>
                   <th width="50">操作</th>
                 </tr>
               </thead>
@@ -178,7 +175,7 @@
         </div>
       </section>
 
-      <!-- AI 智能补全面板 -->
+      <!-- 大模型设置面板 -->
       <section class="panel" id="panel-ai-thinking">
         <div class="panel-header">
           <h2>
@@ -186,47 +183,20 @@
               <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2z"/>
               <path d="M12 6v6l4 2"/>
             </svg>
-            AI 智能补全
+            大模型设置
           </h2>
           <div class="header-actions">
-            <span id="aiThinkingStatus" class="scan-status-text">准备中...</span>
+            <span id="aiThinkingStatus" class="scan-status-text">用于 Agent 对话和采集</span>
           </div>
-        </div>
-
-        <!-- AI 选择器 -->
-        <div class="ai-selector-row">
-          <div class="ai-selector-group">
-            <label>AI 引擎:</label>
-            <div class="radio-group">
-              <label class="radio-label">
-                <input type="radio" name="aiEngine" value="ollama" checked>
-                <span>本地模型 (Ollama)</span>
-              </label>
-              <label class="radio-label">
-                <input type="radio" name="aiEngine" value="deepseek">
-                <span>云端模型 (DeepSeek)</span>
-              </label>
-            </div>
-          </div>
-          <div class="ai-selector-group">
-            <label>模型:</label>
-            <select id="aiModelSelect" class="ai-model-select">
-              <option value="">加载中...</option>
-            </select>
-          </div>
-          <button id="btnAiFill" class="btn-primary">AI 智能补全</button>
-          <button id="btnStopAiFill" class="btn btn-sm btn-secondary" style="display:none;">停止补全</button>
         </div>
 
         <div class="agent-api-config" id="agentApiConfig">
           <div class="agent-api-grid">
             <label class="agent-api-field">
-              <span>API 服务商</span>
+              <span>模型类型</span>
               <select id="agentProvider" class="agent-api-input">
-                <option value="ollama">Ollama 本地</option>
-                <option value="deepseek">DeepSeek</option>
-                <option value="openai">OpenAI</option>
-                <option value="custom">OpenAI 兼容</option>
+                <option value="ollama">本地模型</option>
+                <option value="custom">API 接口</option>
               </select>
             </label>
             <label class="agent-api-field">
@@ -241,23 +211,22 @@
               <span>API Key</span>
               <input id="agentApiKey" class="agent-api-input" type="password" placeholder="仅当前会话使用">
             </label>
+            <label class="agent-api-field">
+              <span>输出模式</span>
+              <select id="agentOutputMode" class="agent-api-input">
+                <option value="auto">自动纠偏</option>
+                <option value="strict_json">严格 JSON</option>
+              </select>
+            </label>
           </div>
           <div class="agent-api-actions">
             <button id="btnAgentTest" class="btn btn-sm btn-secondary">测试连接</button>
             <span id="agentApiStatus" class="scan-status-text">未配置</span>
           </div>
         </div>
-
-        <!-- AI 思考过程 -->
-        <div class="ai-thinking-container">
-          <div class="ai-thinking-list" id="aiThinkingList">
-            <!-- AI 思考过程将在这里动态添加 -->
-          </div>
-          <button class="ai-scroll-bottom" id="btnAiScrollBottom" style="display:none;">回到底部</button>
-        </div>
       </section>
 
-      <!-- 面板3: 执行采集 -->
+      <!-- 面板3: Agent 对话采集 -->
       <section class="panel" id="panel-collect">
         <div class="panel-header">
           <h2>
@@ -265,7 +234,7 @@
               <circle cx="12" cy="12" r="10"/>
               <polyline points="12 6 12 12 16 14"/>
             </svg>
-            执行采集
+            Agent 对话采集
           </h2>
         </div>
         <div class="collect-info" id="collectInfo">
@@ -278,18 +247,55 @@
             <span class="info-value" id="infoRules">未上传模板</span>
           </div>
           <div class="info-row">
-            <span class="info-label">匹配模式:</span>
-            <span class="info-value">三级匹配（精确 / 模糊 / 同义词）</span>
+            <span class="info-label">采集方式:</span>
+            <span class="info-value">AI Agent 调用本地工具采集证据</span>
           </div>
         </div>
-        <div class="action-bar">
-          <button class="btn btn-primary btn-lg" id="btnStartCollect" disabled>
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polygon points="5 3 19 12 5 21 5 3"/>
-            </svg>
-            开始采集
-          </button>
-          <button class="btn btn-secondary btn-lg" id="btnStopCollect" style="display:none;">停止采集</button>
+
+        <details class="agent-settings-panel">
+          <summary>Agent 设置</summary>
+          <div class="agent-settings-grid">
+            <label>
+              <span>最大步骤数</span>
+              <input id="agentMaxSteps" type="number" min="1" max="30" value="10">
+            </label>
+            <label>
+              <span>最长时间(秒)</span>
+              <input id="agentMaxDuration" type="number" min="10" max="1800" value="300">
+            </label>
+            <label>
+              <span>候选知识数</span>
+              <input id="agentMaxCandidates" type="number" min="0" max="30" value="8">
+            </label>
+            <label>
+              <span>工具结果上限</span>
+              <input id="agentMaxResultChars" type="number" min="1000" max="30000" value="7000">
+            </label>
+          </div>
+          <div class="agent-profile-editor">
+            <label for="agentProfileInput">Agent 个性化设定</label>
+            <textarea id="agentProfileInput" rows="9"></textarea>
+            <div class="agent-profile-actions">
+              <button class="btn btn-sm btn-secondary" id="btnResetAgentProfile">恢复默认</button>
+            </div>
+          </div>
+        </details>
+
+        <div class="agent-chat" id="agentChat">
+          <div class="agent-messages" id="agentMessages">
+            <div class="agent-message agent-message-agent">
+              <div class="agent-avatar">AI</div>
+              <div class="agent-bubble">输入采集指令后，我会根据当前磁盘、模板和知识库调用工具查找证据。</div>
+            </div>
+          </div>
+          <button class="agent-scroll-bottom" id="btnAgentScrollBottom" style="display:none;">回到底部</button>
+          <div class="agent-input-row">
+            <textarea id="agentUserInput" rows="2" placeholder="例如：根据当前模板开始采集所有指标；或者：重点查找设备序列号和球管曝光次数"></textarea>
+            <div class="agent-input-actions">
+              <button class="btn btn-primary" id="btnStartCollect" disabled>发送</button>
+              <button class="btn btn-secondary" id="btnStopCollect" style="display:none;">停止</button>
+            </div>
+          </div>
         </div>
 
         <!-- 进度条 -->
@@ -302,51 +308,6 @@
       </section>
 
       <!-- 面板4: 结果展示 -->
-      <!-- 扫描进度面板 -->
-      <section class="panel" id="panel-scan-progress" style="display:none;">
-        <div class="panel-header">
-          <h2>
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="7 10 12 15 17 10"/>
-              <line x1="12" y1="15" x2="12" y2="3"/>
-            </svg>
-            扫描进度
-          </h2>
-          <div class="header-actions">
-            <span id="scanStatusText" class="scan-status-text">准备中...</span>
-          </div>
-        </div>
-
-        <div class="scan-progress-container">
-          <div class="scan-stats">
-            <div class="scan-stat-item">
-              <span class="scan-stat-label">已检查文件:</span>
-              <span class="scan-stat-value" id="scanFileCount">0</span>
-            </div>
-            <div class="scan-stat-item">
-              <span class="scan-stat-label">命中文件:</span>
-              <span class="scan-stat-value" id="scanMatchCount">0</span>
-            </div>
-            <div class="scan-stat-item">
-              <span class="scan-stat-label">当前指标:</span>
-              <span class="scan-stat-value" id="scanCurrentIndicator">-</span>
-            </div>
-            <div class="scan-stat-item">
-              <span class="scan-stat-label">当前级别:</span>
-              <span class="scan-stat-value" id="scanCurrentLevel">-</span>
-            </div>
-          </div>
-
-          <div class="scan-file-list" id="scanFileList">
-            <!-- 扫描文件列表将在这里动态添加 -->
-          </div>
-          <button class="ai-scroll-bottom scan-scroll-bottom" id="btnScanScrollBottom" style="display:none;">回到底部</button>
-        </div>
-      </section>
-
-
-
       <section class="panel" id="panel-result" style="display:none;">
         <div class="panel-header">
           <h2>
@@ -395,10 +356,13 @@
               <tr>
                 <th width="30">#</th>
                 <th>指标</th>
+                <th>采集值</th>
                 <th>文件路径</th>
                 <th>匹配关键字</th>
                 <th>关键字和含义</th>
-                <th>匹配行内容</th>
+                <th>证据内容</th>
+                <th>置信度</th>
+                <th>状态</th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -412,6 +376,7 @@
         <div class="panel-header">
           <h2><span class="panel-icon">📚</span> 采集经验库</h2>
           <div class="panel-actions">
+            <button class="btn btn-primary" id="btnImportRawExperience">导入旧表</button>
             <button class="btn btn-secondary" id="btnRefreshExp"> 刷新</button>
           </div>
         </div>
@@ -425,11 +390,12 @@
             </select>
           </div>
           <button class="btn btn-danger btn-sm" id="btnBatchDeleteExp">🗑️ 批量删除</button>
+          <input type="file" id="rawExperienceFileInput" accept=".xlsx,.xls" style="display:none;">
         </div>
         <div class="exp-list" id="expList">
           <div class="empty-state">
             <p>暂无采集记录</p>
-            <p class="hint">成功采集并保存后，记录会显示在这里</p>
+            <p class="hint">成功采集并保存，或导入旧表后，记录会显示在这里</p>
           </div>
         </div>
       </section>
@@ -480,6 +446,43 @@
         <div class="modal-footer">
           <button class="btn btn-secondary" onclick="closeSaveModal()">取消</button>
           <button class="btn btn-primary" id="btnConfirmSave">💾 保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 导入旧表弹窗 -->
+    <div class="modal-overlay" id="importRawExpModal" style="display:none;">
+      <div class="modal">
+        <div class="modal-header">
+          <h3>导入旧表到经验库</h3>
+          <button class="modal-close" onclick="closeImportRawExperienceModal()">✕</button>
+        </div>
+        <div class="modal-body">
+          <p>支持导入包含“基础数据指标 / 目录或文件路径 / 关键字及含义”等列的 Excel 表。</p>
+          <div class="save-form">
+            <div class="form-group">
+              <label>厂商 <span class="required">*</span></label>
+              <input type="text" id="rawExpVendor" placeholder="例如：Siemens">
+            </div>
+            <div class="form-group">
+              <label>设备类型 <span class="required">*</span></label>
+              <input type="text" id="rawExpDeviceType" placeholder="例如：CT、MRI">
+            </div>
+            <div class="form-group">
+              <label>设备型号</label>
+              <input type="text" id="rawExpModel" placeholder="例如：Perspective P68">
+            </div>
+            <label class="checkbox-row">
+              <input type="checkbox" id="rawExpGenerateCandidates" checked>
+              <span>导入后自动拆解为候选知识规则</span>
+            </label>
+          </div>
+          <div class="import-file-state" id="rawExpFileState">未选择文件</div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="btnDownloadRawExperienceTemplate">下载旧表模板</button>
+          <button class="btn btn-secondary" onclick="closeImportRawExperienceModal()">取消</button>
+          <button class="btn btn-primary" id="btnConfirmImportRawExperience">选择并导入</button>
         </div>
       </div>
     </div>

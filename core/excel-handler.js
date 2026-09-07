@@ -5,9 +5,13 @@ import XLSX from 'xlsx';
 import fs from 'fs';
 import path from 'path';
 
-// 新模板列名映射（支持中英文，4列简化版）
+// 采集任务模板列名映射：只描述本次要采集什么，路径/关键字由 Agent 动态判断
 const NEW_TEMPLATE_COLUMNS = {
+  '序号': 'index', 'no': 'index', '序列': 'index',
   '指标名称': 'indicator', '指标': 'indicator', 'indicator': 'indicator',
+  '基础数据指标': 'indicator', '数据指标': 'indicator',
+  '指标标识': 'indicatorCode', '指标编码': 'indicatorCode', '字段标识': 'indicatorCode',
+  '英文名': 'indicatorCode', 'indicator_code': 'indicatorCode', 'code': 'indicatorCode',
   '参考文件': 'file_pattern', '文件路径': 'file_pattern', 'file_pattern': 'file_pattern', 'file_path': 'file_pattern',
   '关键字': 'keyword', '标准关键词': 'keyword', 'keyword': 'keyword',
   '备用关键字': 'synonyms', '备用关键词': 'synonyms', '同义词': 'synonyms', 'synonyms': 'synonyms',
@@ -20,6 +24,8 @@ const NEW_TEMPLATE_COLUMNS = {
 // 旧模板列名映射
 const OLD_TEMPLATE_COLUMNS = {
   '数据指标': 'indicator', '指标': 'indicator', 'indicator': 'indicator',
+  '指标标识': 'indicatorCode', '指标编码': 'indicatorCode', '字段标识': 'indicatorCode',
+  '英文名': 'indicatorCode', 'indicator_code': 'indicatorCode', 'code': 'indicatorCode',
   '文件路径': 'file_pattern', 'file_path': 'file_pattern',
   '关键字': 'keyword', 'keyword': 'keyword',
   '关键字和含义': 'keywordMeaning', '关键字段及含义': 'keywordMeaning', '含义': 'keywordMeaning',
@@ -29,7 +35,7 @@ const OLD_TEMPLATE_COLUMNS = {
 /**
  * 解析 Excel 模板（自动识别新旧格式）
  * @param {Buffer} buffer - Excel 文件 buffer
- * @returns {Array<{indicator: string, file_pattern: string, keyword: string, synonyms: string[], dataType: string, unit: string}>}
+ * @returns {Array<{indicator: string, indicatorCode: string, file_pattern: string, keyword: string, synonyms: string[], dataType: string, unit: string}>}
  */
 export function parseTemplate(buffer) {
   const workbook = XLSX.read(buffer, { type: 'buffer' });
@@ -45,7 +51,7 @@ export function parseTemplate(buffer) {
 
   // 检测是新格式还是旧格式
   const isNewFormat = headers.some(h =>
-    ['指标名称', '参考文件', '关键字', '标准关键词', '备用关键字', '备用关键词', '关键字和含义', '关键字段及含义', '数据类型', '单位'].includes(h)
+    ['序号', '指标名称', '指标', '基础数据指标', '指标标识', '指标编码', '参考文件', '文件路径', '关键字', '标准关键词', '备用关键字', '备用关键词', '关键字和含义', '关键字段及含义', '数据类型', '单位'].includes(h)
   );
 
   const columnMap = isNewFormat ? NEW_TEMPLATE_COLUMNS : OLD_TEMPLATE_COLUMNS;
@@ -55,7 +61,7 @@ export function parseTemplate(buffer) {
   headers.forEach((header, index) => {
     const normalizedHeader = header.toLowerCase().trim();
     const fieldName = columnMap[normalizedHeader] || columnMap[header];
-    if (fieldName && !columnIndex[fieldName]) {
+    if (fieldName && columnIndex[fieldName] === undefined) {
       columnIndex[fieldName] = index;
     }
   });
@@ -64,13 +70,6 @@ export function parseTemplate(buffer) {
   if (columnIndex.indicator === undefined) {
     throw new Error('模板缺少"指标名称"列');
   }
-  if (columnIndex.file_pattern === undefined) {
-    throw new Error('模板缺少"参考文件"列');
-  }
-  if (columnIndex.keyword === undefined) {
-    throw new Error('模板缺少"标准关键词"列');
-  }
-
   const rules = [];
 
   for (let i = 1; i < data.length; i++) {
@@ -78,13 +77,15 @@ export function parseTemplate(buffer) {
     if (!row || row.length === 0) continue;
 
     const indicator = row[columnIndex.indicator];
-    const filePattern = row[columnIndex.file_pattern];
-    const keyword = row[columnIndex.keyword];
+    const indicatorCode = columnIndex.indicatorCode !== undefined ? row[columnIndex.indicatorCode] : '';
+    const filePattern = columnIndex.file_pattern !== undefined ? row[columnIndex.file_pattern] : '';
+    const keyword = columnIndex.keyword !== undefined ? row[columnIndex.keyword] : '';
 
     if (!indicator) continue;
 
     const rule = {
       indicator: String(indicator).trim(),
+      indicatorCode: indicatorCode ? String(indicatorCode).trim() : '',
       file_pattern: filePattern ? String(filePattern).trim() : '',
       keyword: keyword ? String(keyword).trim() : '',
       synonyms: [],
@@ -136,7 +137,7 @@ export function generateResultExcel(results, scanLog, outputPath) {
   const wb = XLSX.utils.book_new();
 
   // Sheet 1: 采集结果
-  const resultHeaders = ['序号', '指标', '文件路径', '匹配关键字', '关键字和含义', '匹配行内容'];
+  const resultHeaders = ['序号', '指标', '采集值', '文件路径', '匹配关键字', '关键字和含义', '证据内容', '置信度', '状态'];
   const resultData = [resultHeaders];
 
   let rowIndex = 1;
@@ -144,10 +145,13 @@ export function generateResultExcel(results, scanLog, outputPath) {
     resultData.push([
       rowIndex++,
       item.indicator || '',
+      item.value || '-',
       item.file_path || item.filePath || '-',
       item.matchedKeyword || '-',
       item.keywordMeaning || item.keyword_meaning || '-',
-      item.match_line || item.evidence || item.line || '-'
+      item.match_line || item.evidence || item.line || '-',
+      item.confidence || 0,
+      item.status || (isSuccessfulResult(item) ? 'success' : 'not_found')
     ]);
   }
 
@@ -155,8 +159,8 @@ export function generateResultExcel(results, scanLog, outputPath) {
 
   // 设置列宽
   wsResult['!cols'] = [
-    { wch: 8 }, { wch: 20 }, { wch: 55 }, { wch: 24 },
-    { wch: 36 }, { wch: 70 }
+    { wch: 8 }, { wch: 20 }, { wch: 18 }, { wch: 55 }, { wch: 24 },
+    { wch: 36 }, { wch: 70 }, { wch: 12 }, { wch: 14 }
   ];
 
   // 表头样式
@@ -173,23 +177,23 @@ export function generateResultExcel(results, scanLog, outputPath) {
   XLSX.utils.book_append_sheet(wb, wsResult, '采集结果');
 
   // Sheet 2: 未找到列表
-  const missingHeaders = ['指标', '参考文件', '标准关键词', '备用关键词', '关键字和含义', '原因'];
+  const missingHeaders = ['指标', '指标标识', '文件路径', '匹配关键字', '关键字和含义', '原因'];
   const missingData = [missingHeaders];
   const missingItems = results.filter(r => !isSuccessfulResult(r));
 
   for (const item of missingItems) {
     missingData.push([
       item.indicator || '',
+      item.indicatorCode || item.indicator_code || '',
       item.file_pattern || '',
-      item.keyword || '',
-      Array.isArray(item.synonyms) ? item.synonyms.join('; ') : (item.synonyms || ''),
+      item.matchedKeyword || item.keyword || '',
       item.keywordMeaning || item.keyword_meaning || '',
-      '文件未找到或关键字未匹配'
+      item.reason || '未找到可验证证据'
     ]);
   }
 
   const wsMissing = XLSX.utils.aoa_to_sheet(missingData);
-  wsMissing['!cols'] = [{ wch: 20 }, { wch: 25 }, { wch: 25 }, { wch: 30 }, { wch: 36 }, { wch: 25 }];
+  wsMissing['!cols'] = [{ wch: 20 }, { wch: 28 }, { wch: 40 }, { wch: 25 }, { wch: 36 }, { wch: 30 }];
   XLSX.utils.book_append_sheet(wb, wsMissing, '未找到列表');
 
   // Sheet 3: 扫描日志
@@ -256,29 +260,29 @@ function isSuccessfulResult(result) {
 }
 
 /**
- * 生成新格式模板示例
+ * 生成采集任务模板示例
  */
 export function generateTemplateExample(outputPath) {
   const wb = XLSX.utils.book_new();
 
-  const headers = ['指标名称', '参考文件', '关键字', '备用关键字', '关键字和含义'];
+  const headers = ['序号', '指标', '指标标识'];
   const exampleData = [
     headers,
-    ['磁场强度', 'MedCom/log', 'FieldStrength', 'Field;B0;Magnet', 'FieldStrength 表示系统磁场强度'],
-    ['射频功率', 'MedCom/log', 'RF_Power', 'RF Power;TransmitPower', 'RF_Power 表示射频发射功率'],
-    ['梯度线圈温度', 'MriSiteData', 'GradientTemp', 'Gradient Coil Temp;GTemp', 'GradientTemp 表示梯度线圈温度'],
-    ['液氦水平', 'MriSiteData', 'Helium MPS Level', 'Helium Level;He Level;HeMPS', 'Helium MPS Level 表示液氦水平'],
-    ['系统运行时长', 'SysUtil', 'UptimeHours', 'System Uptime;Up Time', 'UptimeHours 表示系统运行时长'],
-    ['冷头压力', 'MriSiteData', 'ColdHeadPressure', 'Cold Head;Pressure', 'ColdHeadPressure 表示冷头压力'],
-    ['系统版本', 'SysUtil', 'SystemVersion', 'SW Version;Syngo Ver', 'SystemVersion 表示系统软件版本'],
-    ['最后校准时间', 'MriSiteData', 'LastCalibration', 'Calibration Date;LastCal', 'LastCalibration 表示最后校准时间'],
-    ['患者ID', 'MedCom/log', 'Patient ID', 'PatID;PatientID', 'Patient ID 表示患者编号字段'],
-    ['序列名称', 'MedCom/log', 'SequenceName', 'Sequence;Seq Name', 'SequenceName 表示扫描序列名称']
+    [1, '磁场强度', 'FieldStrength'],
+    [2, '射频功率', 'RFPower'],
+    [3, '梯度线圈温度', 'GradientTemperature'],
+    [4, '液氦水平', 'HeliumLevel'],
+    [5, '系统运行时长', 'SystemUptime'],
+    [6, '冷头压力', 'ColdHeadPressure'],
+    [7, '系统版本', 'SystemVersion'],
+    [8, '最后校准时间', 'LastCalibrationTime'],
+    [9, '设备序列号', 'SerialNumber'],
+    [10, '球管曝光次数', 'TubeExposureCount']
   ];
 
   const ws = XLSX.utils.aoa_to_sheet(exampleData);
   ws['!cols'] = [
-    { wch: 16 }, { wch: 16 }, { wch: 22 }, { wch: 30 }, { wch: 40 }
+    { wch: 8 }, { wch: 22 }, { wch: 28 }
   ];
 
   // 表头样式
@@ -292,33 +296,66 @@ export function generateTemplateExample(outputPath) {
     };
   }
 
-  XLSX.utils.book_append_sheet(wb, ws, '采集规则');
+  XLSX.utils.book_append_sheet(wb, ws, '采集任务');
 
   // 说明 Sheet
   const helpData = [
     ['字段说明', ''],
     ['字段名', '说明'],
-    ['指标名称', '要采集的参数名称，将显示在结果中'],
-    ['参考文件', '日志文件的路径片段或文件名片段（模糊匹配，不区分大小写）'],
-    ['标准关键词', '在日志文件中搜索的主要关键字'],
-    ['备用关键词', '当标准关键词未匹配时，依次尝试的同义词（用分号分隔）'],
-    ['数据类型', '参数的数据类型：数字/文本（用于结果校验）'],
-    ['单位', '参数的单位（如 ℃、K、%、T、W 等）'],
+    ['序号', '可选，用于人工排序'],
+    ['指标', '必填。本次需要采集的中文指标名称'],
+    ['指标标识', '可选。根据历史经验推测的英文名、字段名或缩写，供 Agent 参考'],
     ['', ''],
-    ['匹配规则说明', ''],
-    ['1. 精确匹配（可信度100%）', '关键词直接出现在日志中，如 FieldStrength = 3.0T'],
-    ['2. 模糊匹配（可信度60-90%）', '关键词拆分为多个单词，部分匹配即可'],
-    ['3. 同义词匹配（可信度50-80%）', '使用备用关键词进行匹配'],
-    ['', ''],
-    ['路径匹配说明', ''],
-    ['参考文件字段支持', '文件名、文件夹名、路径片段、通配符(*.log)'],
-    ['示例: MedCom/log', '匹配路径中包含 MedCom/log 的文件'],
-    ['示例: gradient', '匹配文件名或文件夹名包含 gradient 的文件'],
-    ['示例: *.mrs', '匹配所有 .mrs 扩展名的文件'],
+    ['使用说明', '采集任务模板只表示“本次要找什么”，不要把旧表经验、路径、关键字说明填到这里'],
+    ['路径和关键字', '由 Agent 在采集时结合知识库和模型推测，再调用工具验证'],
+    ['旧表知识库', '请使用“采集经验库 -> 导入旧表”入口导入历史经验']
   ];
 
   const wsHelp = XLSX.utils.aoa_to_sheet(helpData);
   wsHelp['!cols'] = [{ wch: 35 }, { wch: 60 }];
+  XLSX.utils.book_append_sheet(wb, wsHelp, '使用说明');
+
+  const outputDir = path.dirname(outputPath);
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+  }
+  const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+  fs.writeFileSync(outputPath, wbout);
+}
+
+/**
+ * 生成旧表/知识库导入模板示例
+ */
+export function generateKnowledgeImportTemplateExample(outputPath) {
+  const wb = XLSX.utils.book_new();
+  const headers = ['序号', '指标', '指标标识', '文件路径', '关键字及含义'];
+  const data = [
+    headers,
+    [1, '设备序列号', 'SerialNumber', 'C:/logs/ctconfig.xml', 'SerialNumber=ABC123，表示设备序列号'],
+    [2, '球管曝光次数', 'TubeExposureCount', 'C:/logs/tube_history_*.log', 'Exposure Count: 123，表示球管累计曝光次数'],
+    [3, '系统版本', 'SystemVersion', '', 'SystemVersion 或 Software Version 通常表示系统软件版本'],
+    [4, '冷头压力', 'ColdHeadPressure', '', '']
+  ];
+
+  const ws = XLSX.utils.aoa_to_sheet(data);
+  ws['!cols'] = [
+    { wch: 8 }, { wch: 22 }, { wch: 28 }, { wch: 46 }, { wch: 70 }
+  ];
+  XLSX.utils.book_append_sheet(wb, ws, '旧表经验');
+
+  const helpData = [
+    ['字段说明', ''],
+    ['序号', '可选，用于人工排序'],
+    ['指标', '建议填写。历史经验对应的中文指标名'],
+    ['指标标识', '可选。历史经验中推测出的英文名、字段名或缩写'],
+    ['文件路径', '可选。历史找到过的路径，可以包含文件名，盘符不同也没关系'],
+    ['关键字及含义', '可选。历史证据摘要、结果描述、关键字段说明，可包含中文说明和英文日志片段'],
+    ['', ''],
+    ['使用说明', '这个模板只用于补充知识库，不会作为本次采集任务执行'],
+    ['空值处理', '除指标外都可以为空；程序会尽量保留原始信息，后续由 Agent 拆解和验证']
+  ];
+  const wsHelp = XLSX.utils.aoa_to_sheet(helpData);
+  wsHelp['!cols'] = [{ wch: 20 }, { wch: 80 }];
   XLSX.utils.book_append_sheet(wb, wsHelp, '使用说明');
 
   const outputDir = path.dirname(outputPath);

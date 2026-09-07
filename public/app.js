@@ -15,13 +15,51 @@ const state = {
   aiFollowBottom: true,
   scanFollowBottom: true,
   collectAbortController: null,
+  agentStreamingMessage: null,
+  agentFollowBottom: true,
+  agentEditingLocked: false,
+  agentLastErrorMessage: '',
+  rawExperienceImportFile: null,
   agentConfig: {
     provider: 'ollama',
     baseUrl: 'http://localhost:11434',
     model: '',
-    apiKey: ''
+    apiKey: '',
+    outputMode: 'auto'
   }
 };
+
+const DEFAULT_AGENT_PROFILE = `你是医疗设备数据采集场景中的决策大脑/分析师，不直接碰文件系统。
+
+你的工作是：理解待采指标，结合知识库和当前设备上下文推测可能位置，决定下一步调用什么程序工具，判断工具返回结果是否可信，最终输出结构化结论。
+
+分工边界：
+- 你是决策者/分析师：负责理解、推测、决策、判定。
+- 程序是执行器/验证器：负责搜文件、读片段、解析、统计、返回结构化结果。
+- 你不能臆造值，不能假装已经读取文件。
+- 所有结论必须基于程序工具返回的真实证据。
+
+知识使用原则：
+- 你不预设任何固定设备路径或固定指标规则。
+- 你可以参考知识库、旧表经验、指标标识、历史路径和证据摘要。
+- 所有参考信息都只是线索，必须通过当前设备文件重新验证。
+- 验证失败的路径和关键字应标记为无效线索，避免重复尝试。
+
+证据红线：
+- 无证据绝不标成功。
+- 仅关键词命中属于 WEAK，进入待人工确认。
+- 精确 selector、结构化字段、格式匹配、可信文件来源一致时，可作为 MEDIUM。
+- 多个独立可信来源互相印证，或结构化字段与日志证据一致时，可作为 STRONG。
+- 每个结果必须尽量带 data_timestamp、file_mtime、file_path、evidence。
+- 患者检查类参数必须来自同一检查上下文，优先同一源文件；跨文件时必须有明确关联字段。
+- test、template、demo、sample、systemstatus、testProtConfig 等文件不得作为正式结果来源。
+
+输出约束：
+- 决策步骤必须输出结构化 JSON。
+- 如果需要工具，输出 tool_call。
+- 如果现有工具不足，输出 tool_request。
+- 如果证据不足，输出 not_found 或 needs_review。
+- 最终结果必须包含 value、evidence、confidence、evidence_level、reason。`;
 
 // ============ DOM 元素 ============
 const $ = (sel) => document.querySelector(sel);
@@ -51,6 +89,8 @@ async function initApp() {
 
   // 绑定事件
   bindEvents();
+  initAgentProfile();
+  updateCollectButton();
 
   updateFooterStatus('就绪');
 }
@@ -109,6 +149,10 @@ function renderDiskList(disks) {
 }
 
 function selectDisk(diskPath) {
+  if (state.agentEditingLocked) {
+    showToast('Agent 采集中，暂时不能切换磁盘', 'warning');
+    return;
+  }
   if (state.selectedDisks.includes(diskPath)) {
     state.selectedDisks = state.selectedDisks.filter(disk => disk !== diskPath);
   } else {
@@ -311,23 +355,17 @@ async function uploadTemplate(file) {
       // 转换字段名为驼峰格式
       state.templateRules = data.rules.map(r => ({
         indicator: r.indicator || '',
-        filePattern: r.filePattern || r.file_pattern || '',
-        keyword: r.keyword || '',
-        synonyms: Array.isArray(r.synonyms) ? r.synonyms : (r.synonyms ? String(r.synonyms).split(';').map(s => s.trim()) : []),
-        keywordMeaning: r.keywordMeaning || r.keyword_meaning || ''
+        indicatorCode: r.indicatorCode || r.indicator_code || '',
+        filePattern: '',
+        keyword: '',
+        synonyms: [],
+        keywordMeaning: ''
       }));
       state.templateFilename = data.filename;
       renderTemplatePreview();
       updateCollectButton();
       updateStep(2);
-      showToast(`模板解析成功: ${data.count} 条规则 (${data.format === 'new' ? '新格式' : '旧格式'})`, 'success');
-
-      // 自动从经验库填充空白字段
-      const vendor = $('#vendorInput') ? $('#vendorInput').value : '';
-      const deviceType = $('#deviceTypeInput') ? $('#deviceTypeInput').value : '';
-      if (vendor && deviceType) {
-        autoFillFromExperience();
-      }
+      showToast(`采集任务模板解析成功: ${data.count} 个指标`, 'success');
     } else {
       showToast('模板解析失败: ' + data.error, 'error');
     }
@@ -347,18 +385,15 @@ function renderTemplatePreview() {
 
   const tbody = $('#templateTable tbody');
   if (rules.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#888;padding:20px;">暂无规则，点击"+ 添加行"或上传模板</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#888;padding:20px;">暂无指标，点击"+ 添加行"或上传采集任务模板</td></tr>';
     return;
   }
 
   tbody.innerHTML = rules.map((rule, i) => `
     <tr data-index="${i}">
       <td>${i + 1}</td>
-      <td><input type="text" class="rule-input" data-field="indicator" data-index="${i}" value="${escapeHtml(rule.indicator || '')}" placeholder="指标名称"></td>
-      <td><input type="text" class="rule-input" data-field="filePattern" data-index="${i}" value="${escapeHtml(rule.filePattern || '')}" placeholder="参考文件"></td>
-      <td><input type="text" class="rule-input" data-field="keyword" data-index="${i}" value="${escapeHtml(rule.keyword || '')}" placeholder="关键字"></td>
-      <td><input type="text" class="rule-input" data-field="synonyms" data-index="${i}" value="${escapeHtml(Array.isArray(rule.synonyms) ? rule.synonyms.join('; ') : (rule.synonyms || ''))}" placeholder="用分号分隔"></td>
-      <td><input type="text" class="rule-input" data-field="keywordMeaning" data-index="${i}" value="${escapeHtml(rule.keywordMeaning || rule.keyword_meaning || '')}" placeholder="中文含义说明，不参与匹配"></td>
+      <td><input type="text" class="rule-input" data-field="indicator" data-index="${i}" value="${escapeHtml(rule.indicator || '')}" placeholder="中文指标名称"></td>
+      <td><input type="text" class="rule-input" data-field="indicatorCode" data-index="${i}" value="${escapeHtml(rule.indicatorCode || rule.indicator_code || '')}" placeholder="可选，英文名/字段名/缩写"></td>
       <td><button class="btn-icon btn-delete-rule" data-index="${i}" title="删除此行">✕</button></td>
     </tr>
   `).join('');
@@ -380,20 +415,24 @@ function escapeHtml(str) {
   return String(str).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function escapeAttr(str) {
+  return escapeHtml(str).replace(/'/g, '&#39;');
+}
+
 function handleRuleEdit(e) {
-  if (state.aiLoading) return;
+  if (state.aiLoading || state.agentEditingLocked) return;
   const idx = parseInt(e.target.dataset.index);
   const field = e.target.dataset.field;
   const value = e.target.value.trim();
 
-  if (field === 'synonyms') {
-    state.templateRules[idx].synonyms = value.split(/[;；]/).map(s => s.trim()).filter(Boolean);
-  } else {
-    state.templateRules[idx][field] = value;
-  }
+  state.templateRules[idx][field] = value;
 }
 
 function handleDeleteRule(e) {
+  if (state.agentEditingLocked) {
+    showToast('Agent 采集中，暂时不能修改模板', 'warning');
+    return;
+  }
   if (state.aiLoading) {
     showToast('AI补全中，请等待完成', 'warning');
     return;
@@ -405,12 +444,16 @@ function handleDeleteRule(e) {
 }
 
 function addRuleRow() {
+  if (state.agentEditingLocked) {
+    showToast('Agent 采集中，暂时不能修改模板', 'warning');
+    return;
+  }
   if (state.aiLoading) {
     showToast('AI补全中，请等待完成', 'warning');
     return;
   }
   if (!state.templateRules) state.templateRules = [];
-  state.templateRules.push({ indicator: '', filePattern: '', keyword: '', synonyms: [], keywordMeaning: '' });
+  state.templateRules.push({ indicator: '', indicatorCode: '', filePattern: '', keyword: '', synonyms: [], keywordMeaning: '' });
   renderTemplatePreview();
   // 聚焦到新增行的指标名称输入框
   const inputs = document.querySelectorAll('#templateTable tbody .rule-input[data-field="indicator"]');
@@ -418,7 +461,7 @@ function addRuleRow() {
 }
 
 // ============ 采集任务 ============
-async function startCollection() {
+async function startTraditionalCollection() {
   const selectedDisks = getSelectedDisks();
   if (selectedDisks.length === 0 || !state.templateRules.length) return;
 
@@ -618,6 +661,391 @@ function trimScanFileList(fileList) {
   }
 }
 
+async function startCollection() {
+  const selectedDisks = getSelectedDisks();
+  if (state.collectAbortController) return;
+
+  const btn = $('#btnStartCollect');
+  const btnAiFill = $('#btnAiFill');
+  const btnStopCollect = $('#btnStopCollect');
+  const input = $('#agentUserInput');
+  const instruction = input?.value.trim() || (state.templateRules.length ? '请根据当前模板和目标磁盘开始采集所有指标。' : '');
+  if (!instruction) {
+    showToast('请输入对话内容', 'warning');
+    return;
+  }
+
+  state.collectAbortController = new AbortController();
+  state.agentStreamingMessage = null;
+  state.agentFollowBottom = true;
+  state.agentLastErrorMessage = '';
+  setAgentRequestBusy(true);
+  if (input) input.disabled = true;
+
+  showProgress(true, 'Agent 正在处理...');
+  updateFooterStatus('Agent 处理中...');
+  updateStep(3);
+  addAgentMessage('user', instruction);
+  if (input) input.value = '';
+
+  let agentEventSource = null;
+  try {
+    agentEventSource = new EventSource('/api/v1/agent/stream');
+    await waitForEventSourceOpen(agentEventSource, 5000);
+    agentEventSource.onmessage = event => {
+      const data = JSON.parse(event.data);
+      handleAgentEvent(data);
+    };
+
+    const agentOptions = getAgentAIOptions();
+    const res = await fetch('/api/v1/agent/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: state.collectAbortController.signal,
+      body: JSON.stringify({
+        message: instruction,
+        roots: selectedDisks,
+        vendor: $('#vendorInput')?.value || '',
+        deviceType: $('#deviceTypeInput')?.value || '',
+        model: $('#deviceModelInput')?.value || '',
+        instruction,
+        indicators: state.templateRules.map(rule => ({
+          indicator: rule.indicator,
+          indicatorCode: rule.indicatorCode || rule.indicator_code || '',
+          keyword: '',
+          synonyms: [],
+          filePattern: '',
+          keywordMeaning: ''
+        })),
+        provider: agentOptions.provider,
+        backend: agentOptions.backend,
+        baseUrl: agentOptions.baseUrl,
+        apiKey: agentOptions.apiKey,
+        aiModel: agentOptions.provider === 'ollama'
+          ? ($('#aiModelSelect')?.value || agentOptions.model || '')
+          : agentOptions.model,
+        maxSteps: readNumberInput('#agentMaxSteps', 10),
+        maxDurationMs: readNumberInput('#agentMaxDuration', 300) * 1000,
+        maxCandidates: readNumberInput('#agentMaxCandidates', 8),
+        maxResultChars: readNumberInput('#agentMaxResultChars', 7000),
+        agentProfile: getAgentProfile(),
+        outputMode: agentOptions.outputMode || 'auto'
+      })
+    });
+    const data = await res.json();
+
+    if (data.success && data.mode === 'collect') {
+      renderResults(data.results || [], data.scanLog || {});
+      updateStep(4);
+      addAgentMessage('agent', `采集完成：成功 ${data.scanLog?.success_count || 0}/${data.scanLog?.total_indicators || 0}，结果已生成，可下载 Excel。`);
+      showToast(`Agent 采集完成: ${data.scanLog?.success_count || 0}/${data.scanLog?.total_indicators || 0} 成功`, 'success');
+      showSaveExperienceButton(data.results || []);
+    } else if (data.success) {
+      if (data.answer) finishAgentAnswer(data.answer);
+    } else {
+      const errorMessage = data.error || 'Agent 处理失败';
+      if (state.agentLastErrorMessage !== errorMessage) addAgentMessage('error', errorMessage);
+      showToast('Agent 处理失败: ' + (data.error || ''), 'error');
+    }
+  } catch (e) {
+    const aborted = e.name === 'AbortError';
+    addAgentMessage(aborted ? 'muted' : 'error', aborted ? '已停止。' : `处理失败：${e.message}`);
+    showToast(aborted ? '已停止' : 'Agent 处理失败: ' + e.message, aborted ? 'info' : 'error');
+  } finally {
+    if (agentEventSource) agentEventSource.close();
+    state.collectAbortController = null;
+    state.agentStreamingMessage = null;
+    setAgentEditingLocked(false);
+    setAgentRequestBusy(false);
+    if (input) input.disabled = false;
+    showProgress(false);
+    updateFooterStatus('就绪');
+  }
+}
+
+function waitForEventSourceOpen(source, timeout = 5000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Agent 流连接超时')), timeout);
+    source.onopen = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    source.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error('Agent 流连接失败'));
+    };
+  });
+}
+
+function handleAgentEvent(data) {
+  if (!data || data.type === 'init') return;
+  if (data.type === 'chat_intent') {
+    if (data.intent === 'collect') setAgentEditingLocked(true);
+    return;
+  }
+  if (data.type === 'error') {
+    state.agentLastErrorMessage = data.message || '';
+  }
+  if (data.type === 'model_delta') {
+    appendAgentDelta(data.content || '');
+    return;
+  }
+  if (data.type === 'model_step') {
+    state.agentStreamingMessage = null;
+  }
+
+  const text = formatAgentEvent(data);
+  if (!text) return;
+
+  const type = data.type === 'error' || data.type === 'parse_error' ? 'error'
+    : data.type === 'tool_call' || data.type === 'tool_result' || data.type === 'tool_request' ? 'tool'
+    : data.type === 'complete' || data.type === 'indicator_complete' ? 'agent'
+    : 'muted';
+  addAgentMessage(type, text);
+}
+
+function formatAgentEvent(data) {
+  if (data.type === 'parse_repair') {
+    return `模型输出格式不标准，正在纠正：${data.indicator || '当前指标'} 第 ${data.step || '-'} 步`;
+  }
+  if (data.type === 'parse_error') {
+    return `模型没有返回有效 JSON：${data.indicator || '当前指标'} 第 ${data.step || '-'} 步`;
+  }
+  if (data.type === 'tool_request') {
+    const tool = data.tool || '未命名工具';
+    const reason = data.reason || data.expectedOutput || '当前工具箱不能可靠完成这一步';
+    return `工具需求：${tool}\n原因：${reason}`;
+  }
+  const indicator = data.indicator ? `「${data.indicator}」` : '';
+  if (data.type === 'request') return `收到采集任务：${data.indicatorCount || 0} 个指标，${(data.roots || []).join(', ')}`;
+  if (data.type === 'start') return data.message || 'Agent 开始采集';
+  if (data.type === 'indicator_start') return `开始分析指标 ${indicator}（${data.index}/${data.total}）`;
+  if (data.type === 'knowledge') return `知识库候选：${indicator} 找到 ${data.count || 0} 条`;
+  if (data.type === 'model_step') return `模型决策：${indicator} 第 ${data.step}/${data.maxSteps} 步`;
+  if (data.type === 'tool_call') return `调用工具 ${data.tool}：${data.thought || '准备获取证据'}`;
+  if (data.type === 'tool_result') return `工具结果 ${data.tool}：${data.summary || (data.success ? '成功' : '失败')}`;
+  if (data.type === 'indicator_complete') return `指标完成 ${indicator}：${data.status}，置信度 ${data.confidence || 0}%`;
+  if (data.type === 'complete') return data.message || 'Agent 采集完成';
+  if (data.type === 'error') return `错误：${data.message || 'Agent 执行失败'}`;
+  return data.message || '';
+}
+
+function addAgentMessage(role, text) {
+  const list = $('#agentMessages');
+  if (!list) return;
+  const entry = document.createElement('div');
+  const className = role === 'user' ? 'agent-message-user'
+    : role === 'tool' ? 'agent-message-tool'
+    : role === 'error' ? 'agent-message-error'
+    : role === 'muted' ? 'agent-message-muted'
+    : 'agent-message-agent';
+  const avatar = role === 'user' ? '你' : role === 'tool' ? '工具' : role === 'error' ? '!' : 'AI';
+  entry.className = `agent-message ${className}`;
+  entry.innerHTML = `
+    <div class="agent-avatar">${escapeHtml(avatar)}</div>
+    <div class="agent-bubble">${escapeHtml(text)}</div>
+  `;
+  list.appendChild(entry);
+  trimAgentMessages(list);
+  scrollAgentMessagesToBottom();
+  return entry;
+}
+
+function appendAgentDelta(content) {
+  if (!content) return;
+  const list = $('#agentMessages');
+  if (!list) return;
+
+  if (!state.agentStreamingMessage || !list.contains(state.agentStreamingMessage)) {
+    state.agentStreamingMessage = addAgentMessage('agent', '');
+  }
+
+  const bubble = state.agentStreamingMessage?.querySelector('.agent-bubble');
+  if (!bubble) return;
+
+  const nextText = `${bubble.textContent || ''}${content}`;
+  bubble.textContent = compactAgentStreamingText(nextText);
+  scrollAgentMessagesToBottom();
+}
+
+function finishAgentAnswer(answer) {
+  const text = String(answer || '').trim();
+  if (!text) return;
+  const bubble = state.agentStreamingMessage?.querySelector('.agent-bubble');
+  if (bubble) {
+    bubble.textContent = text;
+    state.agentStreamingMessage = null;
+    scrollAgentMessagesToBottom();
+    return;
+  }
+  addAgentMessage('agent', text);
+}
+
+function setAgentRequestBusy(isBusy) {
+  const btn = $('#btnStartCollect');
+  const btnStopCollect = $('#btnStopCollect');
+  if (btn) btn.disabled = isBusy || !canStartAgentCollect();
+  if (btnStopCollect) btnStopCollect.style.display = isBusy ? 'inline-flex' : 'none';
+}
+
+function setAgentEditingLocked(isLocked) {
+  state.agentEditingLocked = isLocked;
+
+  const disabledSelectors = [
+    '#fileInput',
+    '#btnAddRule',
+    '#btnRefreshDisks',
+    '#btnBuildIndex',
+    '#vendorInput',
+    '#deviceTypeInput',
+    '#deviceModelInput',
+    '#agentMaxSteps',
+    '#agentMaxDuration',
+    '#agentMaxCandidates',
+    '#agentMaxResultChars',
+    '#agentProvider',
+    '#agentBaseUrl',
+    '#agentModelName',
+    '#agentApiKey',
+    '#agentOutputMode',
+    '#agentProfileInput',
+    '#btnResetAgentProfile',
+    '#btnAgentTest',
+    '#btnImportRawExperience',
+    '#btnConfirmImportRawExperience',
+    '#btnDownloadRawExperienceTemplate',
+    '#btnBatchDeleteExp'
+  ];
+
+  disabledSelectors.forEach(selector => {
+    const el = $(selector);
+    if (el) el.disabled = isLocked;
+  });
+
+  $$('#templateTable .rule-input, #templateTable .btn-delete-rule').forEach(el => {
+    el.disabled = isLocked;
+  });
+
+  $$('.disk-item').forEach(el => {
+    el.classList.toggle('disabled', isLocked);
+    el.setAttribute('aria-disabled', isLocked ? 'true' : 'false');
+  });
+
+  const uploadZone = $('#uploadZone');
+  if (uploadZone) {
+    uploadZone.classList.toggle('disabled', isLocked);
+    uploadZone.style.pointerEvents = isLocked ? 'none' : '';
+  }
+}
+
+function initAgentProfile() {
+  const input = $('#agentProfileInput');
+  if (!input) return;
+  input.value = localStorage.getItem('agentProfile') || DEFAULT_AGENT_PROFILE;
+  input.addEventListener('input', () => {
+    localStorage.setItem('agentProfile', input.value);
+  });
+
+  const btnReset = $('#btnResetAgentProfile');
+  if (btnReset) {
+    btnReset.addEventListener('click', () => {
+      input.value = DEFAULT_AGENT_PROFILE;
+      localStorage.setItem('agentProfile', DEFAULT_AGENT_PROFILE);
+      showToast('已恢复默认 Agent 设定', 'success');
+    });
+  }
+}
+
+function getAgentProfile() {
+  return $('#agentProfileInput')?.value.trim() || DEFAULT_AGENT_PROFILE;
+}
+
+function compactAgentStreamingText(text) {
+  const value = String(text || '');
+  if (value.length <= 1200) return value;
+  return `${value.slice(0, 500)}\n...\n${value.slice(-650)}`;
+}
+
+function trimAgentMessages(list) {
+  const max = 220;
+  while (list.children.length > max) {
+    list.firstElementChild?.remove();
+  }
+}
+
+function scrollAgentMessagesToBottom() {
+  const list = $('#agentMessages');
+  const bottomBtn = $('#btnAgentScrollBottom');
+  if (!list) return;
+  if (!state.agentFollowBottom) {
+    if (bottomBtn) bottomBtn.style.display = 'block';
+    return;
+  }
+  list.scrollTop = list.scrollHeight;
+  if (bottomBtn) bottomBtn.style.display = 'none';
+}
+
+function readNumberInput(selector, fallback) {
+  const value = Number($(selector)?.value);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function canStartAgentCollect() {
+  return !state.collectAbortController;
+}
+
+function renderResults(results = [], scanLog = {}) {
+  const panel = $('#panel-result');
+  if (panel) panel.style.display = 'block';
+
+  $('#statTotal').textContent = scanLog.total_indicators ?? results.length;
+  $('#statSuccess').textContent = scanLog.success_count ?? results.filter(r => r.status === 'success').length;
+  $('#statFail').textContent = scanLog.fail_count ?? results.filter(r => r.status !== 'success').length;
+  $('#statTime').textContent = `${scanLog.duration || '0.00'}s`;
+
+  const tbody = $('#resultTable tbody');
+  if (!tbody) return;
+
+  tbody.innerHTML = results.map((r, index) => {
+    const status = r.status || (r.success ? 'success' : 'not_found');
+    const confidence = Number(r.confidence || 0);
+    const statusText = getAgentStatusText(status);
+    const confidenceClass = getConfidenceClass(confidence);
+    const filePath = r.filePath || r.file_path || '';
+    const evidence = r.evidence || r.match_line || r.line || '';
+    const keywordMeaning = r.keywordMeaning || r.keyword_meaning || r.reason || '';
+
+    return `
+      <tr>
+        <td>${index + 1}</td>
+        <td class="indicator-cell"><strong>${escapeHtml(r.indicator || '')}</strong></td>
+        <td>${escapeHtml(r.value || '-')}</td>
+        <td class="file-path-full" title="${escapeHtml(filePath)}">${escapeHtml(filePath || '-')}</td>
+        <td class="keyword-cell">${r.matchedKeyword ? `<code>${escapeHtml(r.matchedKeyword)}</code>` : '<span class="text-muted">-</span>'}</td>
+        <td class="keyword-meaning-cell">${keywordMeaning ? escapeHtml(keywordMeaning) : '<span class="text-muted">-</span>'}</td>
+        <td class="match-line-cell">${evidence ? escapeHtml(evidence) : '<span class="text-muted">-</span>'}</td>
+        <td><span class="confidence ${confidenceClass}">${confidence}%</span></td>
+        <td><span class="agent-status-badge agent-status-${escapeHtml(status)}">${escapeHtml(statusText)}</span></td>
+      </tr>
+    `;
+  }).join('');
+
+  panel?.scrollIntoView({ behavior: 'smooth' });
+}
+
+function getAgentStatusText(status) {
+  const map = {
+    success: '成功',
+    failed: '失败',
+    not_found: '未找到',
+    dry_run: '预演',
+    verified: '已验证'
+  };
+  map.needs_tool = '需要工具';
+  map.needs_review = '待确认';
+  return map[status] || status || '-';
+}
+
 function scrollScanProgressToBottom() {
   const fileList = $('#scanFileList');
   const bottomBtn = $('#btnScanScrollBottom');
@@ -763,7 +1191,7 @@ function scrollAiThinkingToBottom() {
   if (bottomBtn) bottomBtn.style.display = 'none';
 }
 
-function renderResults(results, scanLog) {
+function renderTraditionalResults(results, scanLog) {
   $('#panel-result').style.display = 'block';
 
   // 统计卡片
@@ -877,8 +1305,8 @@ function formatPath(filePath) {
 }
 
 function updateCollectButton() {
-  const canCollect = getSelectedDisks().length > 0 && state.templateRules.length > 0;
-  $('#btnStartCollect').disabled = !canCollect;
+  const btn = $('#btnStartCollect');
+  if (btn) btn.disabled = !canStartAgentCollect();
 }
 
 function showProgress(show, text) {
@@ -1004,6 +1432,275 @@ async function saveExperienceFromModal() {
     }
   } catch (e) {
     showToast('保存失败: ' + e.message, 'error');
+  }
+}
+
+function openImportRawExperienceModal() {
+  const modal = $('#importRawExpModal');
+  if (!modal) return;
+
+  const vendor = $('#vendorInput')?.value.trim() || '';
+  const deviceType = $('#deviceTypeInput')?.value.trim() || '';
+  const model = $('#deviceModelInput')?.value.trim() || '';
+  if ($('#rawExpVendor')) $('#rawExpVendor').value = vendor;
+  if ($('#rawExpDeviceType')) $('#rawExpDeviceType').value = deviceType;
+  if ($('#rawExpModel')) $('#rawExpModel').value = model;
+  if ($('#rawExpGenerateCandidates')) $('#rawExpGenerateCandidates').checked = true;
+  if ($('#rawExpFileState')) $('#rawExpFileState').textContent = '未选择文件';
+  state.rawExperienceImportFile = null;
+  modal.style.display = 'flex';
+}
+
+function closeImportRawExperienceModal() {
+  const modal = $('#importRawExpModal');
+  if (modal) modal.style.display = 'none';
+  state.rawExperienceImportFile = null;
+  const input = $('#rawExperienceFileInput');
+  if (input) input.value = '';
+}
+
+function chooseRawExperienceFile() {
+  const input = $('#rawExperienceFileInput');
+  if (input) input.click();
+}
+
+async function legacyImportSelectedRawExperience() {
+  if (!state.rawExperienceImportFile) {
+    chooseRawExperienceFile();
+    return;
+  }
+
+  const vendor = $('#rawExpVendor')?.value.trim() || '';
+  const deviceType = $('#rawExpDeviceType')?.value.trim() || '';
+  const model = $('#rawExpModel')?.value.trim() || '';
+  if (!vendor || !deviceType) {
+    showToast('请填写厂商和设备类型', 'warning');
+    return;
+  }
+
+  const btn = $('#btnConfirmImportRawExperience');
+  const oldText = btn?.textContent || '';
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '导入中...';
+    }
+
+    const form = new FormData();
+    form.append('file', state.rawExperienceImportFile);
+    form.append('vendor', vendor);
+    form.append('deviceType', deviceType);
+    form.append('model', model);
+    form.append('generateCandidates', 'true');
+    const aiOptions = getAgentAIOptions();
+    form.append('provider', aiOptions.provider || '');
+    form.append('backend', aiOptions.backend || aiOptions.provider || '');
+    form.append('baseUrl', aiOptions.baseUrl || '');
+    form.append('apiKey', aiOptions.apiKey || '');
+    form.append('aiModel', aiOptions.model || '');
+
+    const res = await fetch('/api/v1/raw-experience/import', {
+      method: 'POST',
+      body: form
+    });
+    const data = await res.json();
+    if (!data.success) {
+      showToast('导入失败: ' + (data.error || '未知错误'), 'error');
+      return;
+    }
+
+    let message = `已导入 ${data.count || 0} 条旧表记录`;
+    if (shouldGenerate && data.count > 0) {
+      const generated = await generateKnowledgeCandidatesFromImport({
+        vendor,
+        deviceType,
+        model,
+        limit: data.count
+      });
+      if (generated.success) {
+        message += `，生成候选规则 ${generated.count || 0} 条`;
+        if (generated.failCount) message += `，失败 ${generated.failCount} 条`;
+      } else {
+        message += '，候选规则生成失败';
+        showToast('旧表已导入，但候选规则生成失败: ' + (generated.error || ''), 'warning');
+      }
+    }
+
+    showToast(message, 'success');
+    closeImportRawExperienceModal();
+    loadExperienceRecords();
+  } catch (error) {
+    showToast('导入失败: ' + error.message, 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = oldText || '选择并导入';
+    }
+  }
+}
+
+async function importSelectedRawExperience() {
+  if (!state.rawExperienceImportFile) {
+    chooseRawExperienceFile();
+    return;
+  }
+
+  const vendor = $('#rawExpVendor')?.value.trim() || '';
+  const deviceType = $('#rawExpDeviceType')?.value.trim() || '';
+  const model = $('#rawExpModel')?.value.trim() || '';
+
+  if (!vendor || !deviceType) {
+    showToast('请填写厂商和设备类型', 'warning');
+    return;
+  }
+
+  const btn = $('#btnConfirmImportRawExperience');
+  const oldText = btn?.textContent || '';
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '导入并生成知识规则...';
+    }
+
+    const aiOptions = getAgentAIOptions();
+    const form = new FormData();
+    form.append('file', state.rawExperienceImportFile);
+    form.append('vendor', vendor);
+    form.append('deviceType', deviceType);
+    form.append('model', model);
+    form.append('generateCandidates', 'true');
+    form.append('provider', aiOptions.provider || '');
+    form.append('backend', aiOptions.backend || aiOptions.provider || '');
+    form.append('baseUrl', aiOptions.baseUrl || '');
+    form.append('apiKey', aiOptions.apiKey || '');
+    form.append('aiModel', aiOptions.model || '');
+
+    const res = await fetch('/api/v1/raw-experience/import', {
+      method: 'POST',
+      body: form
+    });
+    const data = await res.json();
+    if (!data.success) {
+      showToast('导入失败: ' + (data.error || '未知错误'), 'error');
+      return;
+    }
+
+    showKnowledgeGenerationToast({
+      action: '导入',
+      savedCount: data.count || 0,
+      generatedCount: data.generatedCount || 0,
+      failCount: data.generateFailCount || 0,
+      failureSummary: data.failureSummary || data.failures || []
+    });
+    closeImportRawExperienceModal();
+    loadExperienceRecords();
+  } catch (error) {
+    showToast('导入失败: ' + error.message, 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = oldText || '选择并导入';
+    }
+  }
+}
+
+async function generateKnowledgeCandidatesFromImport({ vendor, deviceType, model, limit }) {
+  const aiOptions = getAgentAIOptions();
+  if (aiOptions.provider !== 'ollama' && !aiOptions.apiKey) {
+    return { success: false, error: '未输入 API Key' };
+  }
+
+  try {
+    const res = await fetch('/api/v1/knowledge-candidates/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vendor,
+        deviceType,
+        model,
+        limit: Math.min(Math.max(Number(limit) || 10, 1), 200),
+        provider: aiOptions.provider,
+        backend: aiOptions.backend,
+        baseUrl: aiOptions.baseUrl,
+        apiKey: aiOptions.apiKey,
+        aiModel: aiOptions.model
+      })
+    });
+    return await res.json();
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+function showKnowledgeGenerationToast({ action, savedCount, generatedCount, failCount, failureSummary }) {
+  const summary = formatKnowledgeFailureSummary(failureSummary);
+  let message = `旧表已${action} ${savedCount || 0} 条。`;
+  message += `知识规则自动提炼成功 ${generatedCount || 0} 条`;
+  if (failCount) {
+    message += `，失败 ${failCount} 条`;
+    if (summary) message += `。主要原因：${summary}`;
+  }
+  showToast(message, failCount ? 'warning' : 'success');
+}
+
+function formatKnowledgeFailureSummary(value) {
+  const list = Array.isArray(value) ? value : [];
+  if (list.length === 0) return '';
+
+  const normalized = list.map(item => {
+    if (typeof item === 'string') return { reason: item, count: 1 };
+    return {
+      reason: item.reason || item.error || '未知错误',
+      count: Number(item.count || 1)
+    };
+  });
+
+  const grouped = new Map();
+  for (const item of normalized) {
+    const reason = normalizeKnowledgeFailureReason(item.reason);
+    grouped.set(reason, (grouped.get(reason) || 0) + item.count);
+  }
+
+  return Array.from(grouped.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2)
+    .map(([reason, count]) => `${reason} ${count} 条`)
+    .join('；');
+}
+
+function normalizeKnowledgeFailureReason(reason) {
+  const text = String(reason || '').trim();
+  if (!text) return '未知错误';
+  if (/api key|unauthorized|401|403|未输入|未提供/i.test(text)) return 'API Key 未配置或无效';
+  if (/not found|model.*not|模型.*不存在|未安装模型|404/i.test(text)) return '模型名称不正确或本地模型未安装';
+  if (/timeout|timed out|超时/i.test(text)) return '模型响应超时';
+  if (/json|有效 JSON|格式/i.test(text)) return '模型没有按 JSON 格式返回';
+  if (/fetch|connect|ECONNREFUSED|ENOTFOUND|network|连接/i.test(text)) return '模型服务连接失败';
+  return text.length > 60 ? `${text.slice(0, 60)}...` : text;
+}
+
+async function generateKnowledgeCandidatesForRawIds(rawExperienceIds = []) {
+  const ids = rawExperienceIds.map(id => Number(id)).filter(id => Number.isInteger(id) && id > 0);
+  if (ids.length === 0) return { success: true, count: 0, failCount: 0 };
+
+  const aiOptions = getAgentAIOptions();
+  try {
+    const res = await fetch('/api/v1/knowledge-candidates/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        rawExperienceIds: ids,
+        limit: Math.min(ids.length, 200),
+        provider: aiOptions.provider,
+        backend: aiOptions.backend,
+        baseUrl: aiOptions.baseUrl,
+        apiKey: aiOptions.apiKey,
+        aiModel: aiOptions.model
+      })
+    });
+    return await res.json();
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
@@ -1245,8 +1942,7 @@ async function aiAutoFill() {
     // 恢复开始采集按钮
     const btnStartCollect = $('#btnStartCollect');
     if (btnStartCollect) {
-      const canCollect = getSelectedDisks().length > 0 && state.templateRules.length > 0;
-      btnStartCollect.disabled = !canCollect;
+      btnStartCollect.disabled = !canStartAgentCollect();
     }
   }
 }
@@ -1314,6 +2010,24 @@ function bindEvents() {
     });
   }
 
+  const agentMessages = $('#agentMessages');
+  if (agentMessages) {
+    agentMessages.addEventListener('scroll', () => {
+      const distanceToBottom = agentMessages.scrollHeight - agentMessages.scrollTop - agentMessages.clientHeight;
+      state.agentFollowBottom = distanceToBottom < 80;
+      const bottomBtn = $('#btnAgentScrollBottom');
+      if (bottomBtn) bottomBtn.style.display = state.agentFollowBottom ? 'none' : 'block';
+    });
+  }
+
+  const btnAgentScrollBottom = $('#btnAgentScrollBottom');
+  if (btnAgentScrollBottom) {
+    btnAgentScrollBottom.addEventListener('click', () => {
+      state.agentFollowBottom = true;
+      scrollAgentMessagesToBottom();
+    });
+  }
+
   // 设备型号选择（如果存在）
   const deviceSelect = $('#deviceSelect');
   if (deviceSelect) {
@@ -1355,6 +2069,15 @@ function bindEvents() {
 
   // 开始采集
   $('#btnStartCollect').addEventListener('click', startCollection);
+  const agentInput = $('#agentUserInput');
+  if (agentInput) {
+    agentInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        startCollection();
+      }
+    });
+  }
 
   const btnStopCollect = $('#btnStopCollect');
   if (btnStopCollect) {
@@ -1398,6 +2121,36 @@ function bindEvents() {
   const btnRefreshExp = $('#btnRefreshExp');
   if (btnRefreshExp) btnRefreshExp.addEventListener('click', loadExperienceRecords);
 
+  const btnImportRawExperience = $('#btnImportRawExperience');
+  if (btnImportRawExperience) btnImportRawExperience.addEventListener('click', openImportRawExperienceModal);
+
+  const btnConfirmImportRawExperience = $('#btnConfirmImportRawExperience');
+  if (btnConfirmImportRawExperience) btnConfirmImportRawExperience.addEventListener('click', importSelectedRawExperience);
+
+  const btnDownloadRawExperienceTemplate = $('#btnDownloadRawExperienceTemplate');
+  if (btnDownloadRawExperienceTemplate) {
+    btnDownloadRawExperienceTemplate.addEventListener('click', () => {
+      window.open('/api/v1/raw-experience/template', '_blank');
+    });
+  }
+
+  const rawExperienceFileInput = $('#rawExperienceFileInput');
+  if (rawExperienceFileInput) {
+    rawExperienceFileInput.addEventListener('change', event => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      if (!/\.(xlsx|xls)$/i.test(file.name)) {
+        showToast('请上传 .xlsx 或 .xls 文件', 'error');
+        event.target.value = '';
+        return;
+      }
+      state.rawExperienceImportFile = file;
+      const fileState = $('#rawExpFileState');
+      if (fileState) fileState.textContent = `已选择：${file.name}`;
+      importSelectedRawExperience();
+    });
+  }
+
   const btnBatchDeleteExp = $('#btnBatchDeleteExp');
   if (btnBatchDeleteExp) btnBatchDeleteExp.addEventListener('click', () => {
     showToast('批量删除功能开发中', 'info');
@@ -1413,7 +2166,7 @@ function stopAiAutoFill() {
 function stopCollection() {
   if (!state.collectAbortController) return;
   state.collectAbortController.abort();
-  $('#scanStatusText').textContent = '正在停止...';
+  addAgentMessage('muted', '正在停止当前 Agent 采集...');
 }
 
 // ==================== AI 功能 ====================
@@ -1423,6 +2176,7 @@ function bindAgentApiConfig() {
   const baseUrlInput = $('#agentBaseUrl');
   const modelInput = $('#agentModelName');
   const apiKeyInput = $('#agentApiKey');
+  const outputModeSelect = $('#agentOutputMode');
   const btnTest = $('#btnAgentTest');
 
   if (!providerSelect || !baseUrlInput || !modelInput || !apiKeyInput) return;
@@ -1432,7 +2186,7 @@ function bindAgentApiConfig() {
     syncAiEngineFromAgentProvider();
   });
 
-  [baseUrlInput, modelInput, apiKeyInput].forEach(input => {
+  [baseUrlInput, modelInput, apiKeyInput, outputModeSelect].filter(Boolean).forEach(input => {
     input.addEventListener('input', () => {
       state.agentConfig = readAgentConfigForm();
     });
@@ -1464,9 +2218,15 @@ function renderAgentConfig(config = {}) {
   const provider = $('#agentProvider');
   const baseUrl = $('#agentBaseUrl');
   const model = $('#agentModelName');
+  const outputMode = $('#agentOutputMode');
+  const providerValue = config.provider || provider?.value || 'ollama';
   if (provider && config.provider) provider.value = config.provider;
-  if (baseUrl) baseUrl.value = config.baseUrl || defaultAgentBaseUrl(provider?.value);
-  if (model) model.value = config.model || defaultAgentModel(provider?.value);
+  if (baseUrl) baseUrl.value = config.baseUrl || defaultAgentBaseUrl(providerValue);
+  if (model) {
+    const modelValue = providerValue === 'ollama' && isCloudDefaultModel(config.model) ? '' : (config.model || defaultAgentModel(providerValue));
+    model.value = modelValue;
+  }
+  if (outputMode) outputMode.value = config.outputMode || 'auto';
   setAgentStatus(config.hasApiKey ? '已配置 Key' : '未配置 Key', config.hasApiKey ? 'success' : 'info');
 }
 
@@ -1477,7 +2237,8 @@ function readAgentConfigForm() {
     backend: provider,
     baseUrl: $('#agentBaseUrl')?.value.trim() || defaultAgentBaseUrl(provider),
     model: $('#agentModelName')?.value.trim() || defaultAgentModel(provider),
-    apiKey: $('#agentApiKey')?.value.trim() || ''
+    apiKey: $('#agentApiKey')?.value.trim() || '',
+    outputMode: $('#agentOutputMode')?.value || 'auto'
   };
 }
 
@@ -1527,8 +2288,9 @@ async function testAgentConnection() {
       showToast('API 模型连接成功', 'success');
       checkAiStatus();
     } else {
-      setAgentStatus(data.error || '连接失败', 'error');
-      showToast('API 模型连接失败: ' + (data.error || ''), 'error');
+      const message = data.message || data.error || '连接失败';
+      setAgentStatus(message, 'error');
+      showToast('API 模型连接失败: ' + message, 'error');
     }
   } catch (error) {
     setAgentStatus('连接失败', 'error');
@@ -1548,19 +2310,20 @@ function setAgentStatus(text, type = 'info') {
 function defaultAgentBaseUrl(provider) {
   const map = {
     ollama: 'http://localhost:11434',
-    deepseek: 'https://api.deepseek.com',
-    openai: 'https://api.openai.com',
-    custom: ''
+    custom: 'https://api.deepseek.com'
   };
   return map[provider] || '';
 }
 
 function defaultAgentModel(provider) {
   const map = {
-    deepseek: 'deepseek-chat',
-    openai: 'gpt-4o-mini'
+    custom: 'deepseek-chat'
   };
   return map[provider] || '';
+}
+
+function isCloudDefaultModel(model) {
+  return ['deepseek-chat', 'deepseek-reasoner', 'gpt-4o-mini', 'gpt-4o'].includes(String(model || '').trim());
 }
 
 async function checkAiStatus() {
@@ -1884,34 +2647,69 @@ async function submitAiTemplate() {
 // ==================== 采集经验库 ====================
 async function loadExperienceRecords() {
   try {
-    const res = await fetch('/api/v1/experience/list');
-    const data = await res.json();
-    if (data.success) {
-      renderExperienceList(data.records);
-    }
+    const [savedRes, rawRes] = await Promise.all([
+      fetch('/api/v1/experience/list'),
+      fetch('/api/v1/raw-experience/list?limit=5000')
+    ]);
+    const savedData = await savedRes.json();
+    const rawData = await rawRes.json();
+    renderExperienceList(
+      savedData.success ? savedData.records : [],
+      rawData.success ? rawData.records : []
+    );
   } catch (err) {
     console.error('加载经验库失败:', err);
   }
 }
 
-function renderExperienceList(records) {
+function renderExperienceList(records, rawRecords = []) {
   const container = $('#expList');
   if (!container) return;
 
-  if (!records || records.length === 0) {
-    container.innerHTML = '<div class="empty-state"><p>暂无采集记录</p></div>';
+  const rawGroups = groupRawExperienceRecords(rawRecords);
+  if ((!records || records.length === 0) && rawGroups.length === 0) {
+    container.innerHTML = '<div class="empty-state"><p>暂无采集记录</p><p class="hint">可以导入以前扫过的表，或保存 Agent 采集结果</p></div>';
     return;
   }
 
   let html = '<div class="experience-list">';
-  for (const rec of records) {
+  for (const group of rawGroups) {
+    html += `
+      <div class="experience-item experience-item-raw">
+        <div class="experience-main">
+          <div class="experience-header">
+            <span class="experience-source-badge">旧表</span>
+            <span class="experience-vendor">${escapeHtml(group.vendor || '未知')}</span>
+            <span class="experience-type">${escapeHtml(group.deviceType || '-')}</span>
+            <span class="experience-model">${escapeHtml(group.model || '通用')}</span>
+            <span class="experience-date">${escapeHtml(group.importedAt || '-')}</span>
+          </div>
+          <div class="experience-summary">
+            ${escapeHtml(group.sourceFile || '未命名表格')}，${group.count} 条原始经验，示例指标：${escapeHtml(group.sampleIndicators.join('、') || '-')}
+          </div>
+        </div>
+        <div class="experience-actions">
+          <button class="btn-sm btn-warn" onclick="editRawExperienceGroup('${escapeAttr(group.key)}')">编辑</button>
+          <button class="btn-sm btn-danger" onclick="deleteRawExperienceGroup('${escapeAttr(group.key)}')">删除</button>
+        </div>
+      </div>
+    `;
+  }
+
+  for (const rec of records || []) {
     html += `
       <div class="experience-item">
-        <div class="experience-header">
-          <span class="experience-vendor">${rec.vendor || '未知'}</span>
-          <span class="experience-type">${rec.deviceType || '-'}</span>
-          <span class="experience-model">${rec.model || '通用'}</span>
-          <span class="experience-date">${rec.savedAt || '-'}</span>
+        <div class="experience-main">
+          <div class="experience-header">
+            <span class="experience-source-badge saved">采集</span>
+            <span class="experience-vendor">${escapeHtml(rec.vendor || '未知')}</span>
+            <span class="experience-type">${escapeHtml(rec.deviceType || '-')}</span>
+            <span class="experience-model">${escapeHtml(rec.model || '通用')}</span>
+            <span class="experience-date">${escapeHtml(rec.savedAt || '-')}</span>
+          </div>
+          <div class="experience-summary">
+            ${rec.indicatorCount || 0} 条规则，成功率 ${rec.successRate || 0}%
+          </div>
         </div>
         <div class="experience-actions">
           <button class="btn-sm btn-warn" onclick="editExperience('${rec.id}')">编辑</button>
@@ -1922,6 +2720,204 @@ function renderExperienceList(records) {
   }
   html += '</div>';
   container.innerHTML = html;
+}
+
+function groupRawExperienceRecords(records = []) {
+  const groups = new Map();
+  for (const rec of records) {
+    const key = [
+      rec.sourceFile || '',
+      rec.vendor || '',
+      rec.deviceType || '',
+      rec.model || '',
+      rec.importedAt || ''
+    ].join('||');
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        sourceFile: rec.sourceFile || '',
+        vendor: rec.vendor || '',
+        deviceType: rec.deviceType || '',
+        model: rec.model || '',
+        importedAt: rec.importedAt || '',
+        count: 0,
+        sampleIndicators: [],
+        records: []
+      });
+    }
+    const group = groups.get(key);
+    group.count += 1;
+    group.records.push(rec);
+    if (rec.indicatorName && group.sampleIndicators.length < 3 && !group.sampleIndicators.includes(rec.indicatorName)) {
+      group.sampleIndicators.push(rec.indicatorName);
+    }
+  }
+  const orderedGroups = Array.from(groups.values()).map(group => {
+    group.records.sort((a, b) => Number(a.rowNumber || 0) - Number(b.rowNumber || 0));
+    group.sampleIndicators = [];
+    for (const record of group.records) {
+      if (record.indicatorName && group.sampleIndicators.length < 3 && !group.sampleIndicators.includes(record.indicatorName)) {
+        group.sampleIndicators.push(record.indicatorName);
+      }
+    }
+    return group;
+  });
+  window._rawExperienceGroups = Object.fromEntries(orderedGroups.map(group => [group.key, group]));
+  return orderedGroups;
+}
+
+function editRawExperienceGroup(groupKey) {
+  const group = window._rawExperienceGroups?.[groupKey];
+  if (!group) {
+    showToast('未找到旧表分组', 'error');
+    return;
+  }
+
+  let modal = $('#rawExperienceEditModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'rawExperienceEditModal';
+    modal.className = 'modal-overlay';
+    document.body.appendChild(modal);
+  }
+
+  const rows = (group.records || []).map((record, index) => `
+    <tr data-id="${escapeAttr(record.id)}">
+      <td>${index + 1}</td>
+      <td><input class="raw-exp-input" data-field="indicatorName" value="${escapeAttr(record.indicatorName || '')}"></td>
+      <td><input class="raw-exp-input" data-field="indicatorCode" value="${escapeAttr(record.indicatorCode || '')}"></td>
+      <td><input class="raw-exp-input" data-field="filePathRaw" value="${escapeAttr(record.filePathRaw || '')}"></td>
+      <td><textarea class="raw-exp-input" data-field="keywordMeaningRaw" rows="2">${escapeHtml(record.keywordMeaningRaw || '')}</textarea></td>
+    </tr>
+  `).join('');
+
+  modal.innerHTML = `
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h3>编辑旧表知识库</h3>
+        <button class="modal-close" onclick="closeRawExperienceEditModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="raw-exp-group-meta">
+          ${escapeHtml(group.vendor || '未知')} / ${escapeHtml(group.deviceType || '-')} / ${escapeHtml(group.model || '通用')}
+          <span>${escapeHtml(group.sourceFile || '')}</span>
+        </div>
+        <div class="table-wrapper raw-exp-edit-wrapper">
+          <table class="data-table raw-exp-edit-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>指标</th>
+                <th>指标标识</th>
+                <th>文件路径</th>
+                <th>关键字及含义</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeRawExperienceEditModal()">取消</button>
+        <button class="btn btn-primary" onclick="saveRawExperienceGroup('${escapeAttr(groupKey)}')">保存并重新生成规则</button>
+      </div>
+    </div>
+  `;
+  modal.style.display = 'flex';
+}
+
+function closeRawExperienceEditModal() {
+  const modal = $('#rawExperienceEditModal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function saveRawExperienceGroup(groupKey) {
+  const group = window._rawExperienceGroups?.[groupKey];
+  const modal = $('#rawExperienceEditModal');
+  if (!group || !modal) return;
+
+  const rows = Array.from(modal.querySelectorAll('tbody tr'));
+  const updates = rows.map(row => {
+    const payload = {};
+    row.querySelectorAll('.raw-exp-input').forEach(input => {
+      payload[input.dataset.field] = input.value.trim();
+    });
+    return { id: row.dataset.id, payload };
+  }).filter(item => item.id);
+
+  try {
+    for (const item of updates) {
+      const res = await fetch(`/api/v1/raw-experience/${encodeURIComponent(item.id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(item.payload)
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || '保存旧表记录失败');
+    }
+
+    const generated = await generateKnowledgeCandidatesForRawIds(updates.map(item => item.id));
+    showKnowledgeGenerationToast({
+      action: '保存',
+      savedCount: updates.length,
+      generatedCount: generated.success ? (generated.count || 0) : 0,
+      failCount: generated.success ? (generated.failCount || 0) : updates.length,
+      failureSummary: generated.success ? (generated.failureSummary || generated.failures || []) : [{ reason: generated.error || '未知错误', count: updates.length }]
+    });
+    closeRawExperienceEditModal();
+    loadExperienceRecords();
+  } catch (error) {
+    showToast('保存失败: ' + error.message, 'error');
+  }
+}
+
+async function deleteRawExperienceGroup(groupKey) {
+  const group = window._rawExperienceGroups?.[groupKey];
+  if (!group) {
+    showToast('未找到旧表分组', 'error');
+    return;
+  }
+  if (!confirm(`确定删除这批旧表记录吗？共 ${group.count || 0} 条。`)) return;
+
+  try {
+    const res = await fetch('/api/v1/raw-experience', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vendor: group.vendor || '',
+        deviceType: group.deviceType || '',
+        model: group.model || '',
+        sourceFile: group.sourceFile || '',
+        importedAt: group.importedAt || ''
+      })
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || '删除失败');
+    showToast(`旧表记录已删除 ${data.count || 0} 条`, 'success');
+    loadExperienceRecords();
+  } catch (error) {
+    showToast('删除失败: ' + error.message, 'error');
+  }
+}
+
+async function generateKnowledgeForRawGroup(groupKey) {
+  const group = window._rawExperienceGroups?.[groupKey];
+  if (!group) {
+    showToast('未找到旧表分组', 'error');
+    return;
+  }
+  showToast('正在生成候选规则...', 'info');
+  const result = await generateKnowledgeCandidatesFromImport({
+    vendor: group.vendor,
+    deviceType: group.deviceType,
+    model: group.model,
+    limit: group.count
+  });
+  if (result.success) {
+    showToast(`候选规则生成完成：${result.count || 0} 条，失败 ${result.failCount || 0} 条`, result.failCount ? 'warning' : 'success');
+  } else {
+    showToast('候选规则生成失败: ' + (result.error || ''), 'error');
+  }
 }
 
 async function loadExperience(id) {

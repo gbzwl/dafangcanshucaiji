@@ -29,7 +29,7 @@ import {
   checkIndexStatus
 } from './core/matcher.js';
 import { extractParameter, batchExtractWithProgress } from './core/extractor.js';
-import { parseTemplate, generateResultExcel, generateTemplateExample } from './core/excel-handler.js';
+import { parseTemplate, generateResultExcel, generateTemplateExample, generateKnowledgeImportTemplateExample } from './core/excel-handler.js';
 import { callAI, callAIStream, checkAIService, getAvailableBackends, extractJSON, testAIConnection, normalizeAIOptions } from './core/ai-service.js';
 import { aiMatchParameter, aiBatchMatch } from './core/ai-matcher.js';
 import { discoverUnknownParameters, scanLogFiles, extractFieldsFromFile } from './core/ai-discoverer.js';
@@ -46,6 +46,7 @@ import {
   deleteRecords,
   importRawExperienceWorkbook,
   getRawExperienceRecords,
+  updateRawExperienceRecord,
   clearRawExperienceRecords,
   getRawExperienceByIds,
   saveKnowledgeCandidate,
@@ -93,7 +94,8 @@ let agentRuntimeConfig = {
   backend: 'ollama',
   baseUrl: 'http://localhost:11434',
   model: '',
-  apiKey: ''
+  apiKey: '',
+  outputMode: 'auto'
 };
 
 // 初始化采集经验库
@@ -234,6 +236,101 @@ function normalizeGeneratedCandidate(record, parsed, aiResult = {}) {
   };
 }
 
+async function generateKnowledgeCandidatesForRecords(records = [], options = {}) {
+  const {
+    backend = '',
+    provider = '',
+    baseUrl = '',
+    apiKey = '',
+    aiModel = '',
+    modelName = '',
+    dryRun = false,
+    replaceExistingDraft = true,
+    limit = records.length || 10
+  } = options;
+
+  const selectedRecords = records.slice(0, Math.max(1, Number(limit) || 10));
+  const generated = [];
+  const failures = [];
+
+  for (const record of selectedRecords) {
+    try {
+      const prompt = buildKnowledgeCandidatePrompt(record);
+      if (dryRun) {
+        generated.push({ rawExperienceId: record.id, prompt });
+        continue;
+      }
+
+      const aiResult = await callAIStream(
+        prompt,
+        {
+          ...mergeAgentAIOptions({
+            backend,
+            provider,
+            baseUrl,
+            apiKey,
+            model: modelName || aiModel || undefined
+          }),
+          maxTokens: 1200,
+          timeout: 60000,
+          formatJson: false
+        }
+      );
+      const parsed = extractJSON(aiResult.content);
+      if (!parsed) {
+        failures.push({
+          rawExperienceId: record.id,
+          indicator: record.indicatorName || '',
+          error: 'AI 未返回有效 JSON'
+        });
+        continue;
+      }
+
+      const candidate = normalizeGeneratedCandidate(record, parsed, aiResult);
+      if (replaceExistingDraft && record.id) {
+        clearKnowledgeCandidates({ rawExperienceId: record.id, status: 'draft' });
+      }
+      generated.push(saveKnowledgeCandidate(candidate));
+    } catch (error) {
+      failures.push({
+        rawExperienceId: record.id,
+        indicator: record.indicatorName || '',
+        error: error.message
+      });
+    }
+  }
+
+  return {
+    generated,
+    failures,
+    failureSummary: summarizeKnowledgeGenerationFailures(failures),
+    count: generated.length,
+    failCount: failures.length
+  };
+}
+
+function summarizeKnowledgeGenerationFailures(failures = []) {
+  const groups = new Map();
+  for (const failure of failures) {
+    const reason = normalizeKnowledgeGenerationError(failure.error);
+    groups.set(reason, (groups.get(reason) || 0) + 1);
+  }
+  return Array.from(groups.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => ({ reason, count }));
+}
+
+function normalizeKnowledgeGenerationError(error = '') {
+  const text = String(error || '').trim();
+  if (!text) return '未知错误';
+  if (/api key|unauthorized|401|403|未输入|未提供/i.test(text)) return 'API Key 未配置或无效';
+  if (/not found|model.*not|模型.*不存在|未安装模型|404/i.test(text)) return '模型名称不正确或本地模型未安装';
+  if (/timeout|timed out|超时/i.test(text)) return '模型响应超时';
+  if (/json|有效 JSON|格式/i.test(text)) return '模型没有按 JSON 格式返回';
+  if (/fetch|connect|ECONNREFUSED|ENOTFOUND|network|连接/i.test(text)) return '模型服务连接失败';
+  return text.length > 80 ? `${text.slice(0, 80)}...` : text;
+}
+
 function normalizeCandidateArray(value) {
   const list = Array.isArray(value) ? value : String(value || '').split(/\r?\n|;|；|,/);
   return [...new Set(list.map(item => String(item || '').trim()).filter(Boolean))].slice(0, 20);
@@ -270,7 +367,8 @@ function mergeAgentAIOptions(options = {}) {
     model: options.model || options.aiModel || agentRuntimeConfig.model || '',
     timeout: options.timeout,
     temperature: options.temperature,
-    maxTokens: options.maxTokens
+    maxTokens: options.maxTokens,
+    outputMode: options.outputMode || agentRuntimeConfig.outputMode || 'auto'
   };
 }
 
@@ -282,7 +380,8 @@ function normalizeAgentConfigInput(input = {}) {
     backend: input.backend || provider,
     baseUrl,
     model: input.model || input.aiModel || defaultModel(provider),
-    apiKey: input.apiKey || ''
+    apiKey: input.apiKey || '',
+    outputMode: input.outputMode || 'auto'
   };
 }
 
@@ -292,13 +391,14 @@ function publicAgentConfig(config = agentRuntimeConfig) {
     backend: config.backend,
     baseUrl: config.baseUrl,
     model: config.model,
-    hasApiKey: !!config.apiKey
+    hasApiKey: !!config.apiKey,
+    outputMode: config.outputMode || 'auto'
   };
 }
 
 function defaultBaseUrl(provider) {
   const normalized = String(provider || '').toLowerCase();
-  if (normalized === 'deepseek') return 'https://api.deepseek.com';
+  if (normalized === 'deepseek' || normalized === 'custom' || normalized === 'api') return 'https://api.deepseek.com';
   if (normalized === 'openai') return 'https://api.openai.com';
   if (normalized === 'ollama') return 'http://localhost:11434';
   return '';
@@ -306,7 +406,7 @@ function defaultBaseUrl(provider) {
 
 function defaultModel(provider) {
   const normalized = String(provider || '').toLowerCase();
-  if (normalized === 'deepseek') return 'deepseek-chat';
+  if (normalized === 'deepseek' || normalized === 'custom' || normalized === 'api') return 'deepseek-chat';
   if (normalized === 'openai') return 'gpt-4o-mini';
   return '';
 }
@@ -323,6 +423,237 @@ function normalizeAgentResultsForExcel(results = []) {
     matchMethod: `Agent ${item.status || 'unknown'}`,
     success: item.status === 'success'
   }));
+}
+
+function normalizeAgentCollectionBody(body = {}) {
+  return {
+    roots: body.roots || body.diskRoots || (body.diskRoot ? [body.diskRoot] : []),
+    indicators: filterIndicatorsByInstruction(body.indicators || body.rules || [], body.message || body.instruction || ''),
+    vendor: body.vendor || '',
+    deviceType: body.deviceType || '',
+    model: body.deviceModel || body.machineModel || body.model || '',
+    maxSteps: body.maxSteps,
+    maxCandidates: body.maxCandidates,
+    maxResultChars: body.maxResultChars,
+    maxDurationMs: body.maxDurationMs,
+    dryRun: body.dryRun,
+    agentProfile: body.agentProfile || ''
+  };
+}
+
+function filterIndicatorsByInstruction(indicators = [], instruction = '') {
+  if (!Array.isArray(indicators)) return [];
+
+  const normalizedIndicators = indicators.filter(item => {
+    const name = typeof item === 'string' ? item : item?.indicator || item?.name || item?.indicatorName;
+    return String(name || '').trim();
+  });
+  if (normalizedIndicators.length <= 1) return normalizedIndicators;
+
+  const text = String(instruction || '').trim();
+  if (!text) return normalizedIndicators;
+  if (/(全部|所有|全量|当前模板|整张表|每个指标|all)/i.test(text)) return normalizedIndicators;
+
+  const matched = normalizedIndicators.filter(item => {
+    const indicator = String(item.indicator || item.name || item.indicatorName || item || '').trim();
+    const code = String(item.indicatorCode || item.indicator_code || item.code || '').trim();
+    return isIndicatorMentioned(text, indicator) || (code && isIndicatorMentioned(text, code));
+  });
+
+  return matched.length > 0 ? matched : normalizedIndicators;
+}
+
+function isIndicatorMentioned(text, indicator) {
+  const value = String(indicator || '').trim();
+  if (!value) return false;
+  if (text.includes(value)) return true;
+
+  const compactText = text.replace(/\s+/g, '');
+  const compactValue = value.replace(/\s+/g, '');
+  if (compactValue && compactText.includes(compactValue)) return true;
+
+  const ascii = value.toLowerCase();
+  if (/^[\x00-\x7F]+$/.test(ascii) && text.toLowerCase().includes(ascii)) return true;
+  return false;
+}
+
+async function executeAgentCollection(body = {}, signal = null) {
+  const request = normalizeAgentCollectionBody(body);
+
+  if (!Array.isArray(request.roots) || request.roots.length === 0) {
+    throw new Error('请先选择目标磁盘，然后再开始采集。');
+  }
+  if (!Array.isArray(request.indicators) || request.indicators.length === 0) {
+    throw new Error('请先导入采集任务模板，或在模板预览里添加至少一个指标。');
+  }
+
+  const aiOptions = mergeAgentAIOptions({
+    provider: body.provider,
+    backend: body.backend,
+    baseUrl: body.baseUrl,
+    apiKey: body.apiKey,
+    model: body.modelName || body.aiModel,
+    temperature: body.temperature,
+    maxTokens: body.maxTokens,
+    timeout: body.timeout,
+    outputMode: body.outputMode
+  });
+  if (signal) aiOptions.signal = signal;
+
+  await pushAgentEventNow({
+    type: 'request',
+    message: '收到 Agent 采集请求',
+    roots: request.roots,
+    indicatorCount: request.indicators.length,
+    ai: normalizeAIOptions(aiOptions)
+  });
+
+  const result = await runAgentCollection({
+    vendor: request.vendor,
+    deviceType: request.deviceType,
+    model: request.model,
+    roots: request.roots,
+    indicators: request.indicators,
+    aiOptions,
+    maxSteps: request.maxSteps,
+    maxCandidates: request.maxCandidates,
+    maxResultChars: request.maxResultChars,
+    maxDurationMs: request.maxDurationMs,
+    dryRun: request.dryRun,
+    agentProfile: request.agentProfile
+  }, {
+    onEvent: event => {
+      if (signal?.aborted) return;
+      pushAgentEvent(event);
+    }
+  });
+
+  const excelResults = normalizeAgentResultsForExcel(result.results);
+  const successCount = excelResults.filter(item => item.success).length;
+  const scanLog = {
+    scan_time: new Date().toLocaleString('zh-CN'),
+    disk: request.roots.join(', '),
+    total_files: result.toolCalls
+      .filter(call => call.tool === 'search_files')
+      .reduce((sum, call) => sum + (call.result?.checked?.files || 0), 0),
+    success_count: successCount,
+    fail_count: excelResults.length - successCount,
+    total_indicators: excelResults.length,
+    duration: (result.durationMs / 1000).toFixed(2),
+    template_rules: request.indicators.length,
+    used_index: false,
+    collector: 'agent'
+  };
+
+  if (!request.dryRun) {
+    const outputPath = path.join(TEMP_DIR, 'MRI_Result.xlsx');
+    generateResultExcel(excelResults, scanLog, outputPath);
+  }
+
+  return {
+    ...result,
+    scanLog,
+    exportReady: !request.dryRun
+  };
+}
+
+function detectAgentIntent(message = '') {
+  const text = String(message || '').trim().toLowerCase();
+  if (!text) return 'empty';
+
+  if ((text.includes('模型') || text.includes('model')) && /(你|当前|现在|什么|哪个|名称|配置|使用|用的是|provider|what|which|using|use|are you)/.test(text)) {
+    return 'config';
+  }
+  if (text.includes('api key') || text.includes('base url') || text.includes('服务商')) {
+    return 'config';
+  }
+  if (/(开始|执行|进行|帮我|根据|用当前|按当前).*(采集|扫描|搜寻|搜索|查找|提取)|^(采集|扫描|开始采集|开始扫描)$/.test(text)) {
+    return 'collect';
+  }
+  if (/(你是|你用|当前|现在).*(什么|哪个)?.*(模型|大模型)|模型.*(是什么|名称|配置)|api.*(配置|key|服务商)|provider|base url/.test(text)) {
+    return 'config';
+  }
+  if (/(停止|中止|取消|暂停).*(采集|扫描|任务)?/.test(text)) {
+    return 'stop';
+  }
+  return 'chat';
+}
+
+function getAgentCollectPreflightMessage(body = {}) {
+  const { roots, indicators } = normalizeAgentCollectionBody(body);
+  const missing = [];
+  if (!Array.isArray(roots) || roots.length === 0) missing.push('目标磁盘');
+  if (!Array.isArray(indicators) || indicators.length === 0) missing.push('采集任务模板或指标');
+  if (missing.length === 0) return '';
+  return `现在还不能开始采集，请先补充：${missing.join('、')}。`;
+}
+
+function buildAgentConfigAnswer(body = {}) {
+  const aiOptions = mergeAgentAIOptions({
+    provider: body.provider,
+    backend: body.backend,
+    baseUrl: body.baseUrl,
+    apiKey: body.apiKey,
+    model: body.modelName || body.aiModel
+  });
+  const normalized = normalizeAIOptions(aiOptions);
+  return [
+    `当前配置的大模型服务商是 ${normalized.provider}。`,
+    `模型名称是 ${normalized.model || '未填写'}。`,
+    `Base URL 是 ${normalized.baseUrl || '未填写'}。`,
+    normalized.provider === 'ollama'
+      ? '这是本地 Ollama 模型，需要模型名称和本机已安装模型完全一致。'
+      : `API Key ${normalized.hasApiKey ? '已在当前请求中提供' : '未提供'}。`
+  ].join('\n');
+}
+
+async function answerAgentChat(body = {}, signal = null) {
+  const message = String(body.message || body.instruction || '').trim();
+  const roots = Array.isArray(body.roots) ? body.roots : (body.roots ? [body.roots] : []);
+  const aiOptions = mergeAgentAIOptions({
+    provider: body.provider,
+    backend: body.backend,
+    baseUrl: body.baseUrl,
+    apiKey: body.apiKey,
+    model: body.modelName || body.aiModel,
+    temperature: body.temperature,
+    maxTokens: body.maxTokens || 800,
+    timeout: body.timeout,
+    outputMode: body.outputMode
+  });
+  if (signal) aiOptions.signal = signal;
+
+  const prompt = `你是大放设备参数采集工具里的 Agent 助手。
+你可以回答用户关于模型配置、采集流程、知识库、模板字段、操作方式的问题。
+如果用户没有明确要求开始采集，不要假装已经扫描磁盘，也不要输出采集结果。
+
+当前上下文：
+- 厂商：${body.vendor || ''}
+- 设备类型：${body.deviceType || ''}
+- 型号：${body.model || ''}
+- 已选根目录：${roots.join(' | ')}
+- 当前采集指标数：${Array.isArray(body.indicators) ? body.indicators.length : 0}
+- 当前模型：${aiOptions.provider} / ${aiOptions.model || '未填写'}
+- 输出模式：${aiOptions.outputMode || 'auto'}
+
+Agent 个性化设定：
+${body.agentProfile || '未设置'}
+
+用户问题：${message}`;
+
+  const aiResult = await callAIStream(prompt, {
+    ...aiOptions,
+    formatJson: false,
+    temperature: 0.3,
+    maxTokens: 800
+  }, token => {
+    pushAgentEvent({
+      type: 'model_delta',
+      content: token
+    });
+  });
+
+  return aiResult.content || '我没有生成有效回复。';
 }
 
 app.get('/api/v1/health', (req, res) => {
@@ -376,7 +707,7 @@ app.post('/api/v1/agent/test', async (req, res) => {
   }
 });
 
-app.post('/api/v1/raw-experience/import', upload.single('file'), (req, res) => {
+app.post('/api/v1/raw-experience/import', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, error: '未上传文件' });
@@ -390,11 +721,31 @@ app.post('/api/v1/raw-experience/import', upload.single('file'), (req, res) => {
       sourceFile: decodedFilename
     });
 
+    const shouldGenerate = String(req.body.generateCandidates ?? 'true') !== 'false';
+    let candidateResult = { generated: [], failures: [], count: 0, failCount: 0 };
+    if (shouldGenerate && result.records.length > 0) {
+      candidateResult = await generateKnowledgeCandidatesForRecords(result.records, {
+        provider: req.body.provider || req.body.backend || '',
+        backend: req.body.backend || req.body.provider || '',
+        baseUrl: req.body.baseUrl || '',
+        apiKey: req.body.apiKey || '',
+        aiModel: req.body.aiModel || '',
+        modelName: req.body.modelName || '',
+        limit: result.records.length,
+        replaceExistingDraft: true
+      });
+    }
+
     res.json({
       success: true,
       filename: decodedFilename,
       count: result.count,
       sheets: result.sheets,
+      generated: candidateResult.generated,
+      failures: candidateResult.failures,
+      failureSummary: candidateResult.failureSummary || [],
+      generatedCount: candidateResult.count,
+      generateFailCount: candidateResult.failCount,
       preview: result.records.slice(0, 20)
     });
   } catch (err) {
@@ -409,6 +760,8 @@ app.get('/api/v1/raw-experience/list', (req, res) => {
       deviceType: req.query.deviceType || '',
       model: req.query.model || '',
       indicator: req.query.indicator || '',
+      sourceFile: req.query.sourceFile || '',
+      importedAt: req.query.importedAt || '',
       limit: req.query.limit || 200
     });
     res.json({ success: true, records, count: records.length });
@@ -417,10 +770,25 @@ app.get('/api/v1/raw-experience/list', (req, res) => {
   }
 });
 
+app.put('/api/v1/raw-experience/:id', (req, res) => {
+  try {
+    const record = updateRawExperienceRecord(req.params.id, req.body || {});
+    clearKnowledgeCandidates({ rawExperienceId: req.params.id, status: 'draft' });
+    res.json({ success: true, record });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
 app.delete('/api/v1/raw-experience', (req, res) => {
   try {
-    clearRawExperienceRecords(req.body || {});
-    res.json({ success: true });
+    const filters = req.body || {};
+    const records = getRawExperienceRecords({ ...filters, limit: 10000 });
+    for (const record of records) {
+      clearKnowledgeCandidates({ rawExperienceId: record.id });
+    }
+    clearRawExperienceRecords(filters);
+    res.json({ success: true, count: records.length });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -499,6 +867,7 @@ app.post('/api/v1/knowledge-candidates/generate', async (req, res) => {
       success: true,
       generated,
       failures,
+      failureSummary: summarizeKnowledgeGenerationFailures(failures),
       count: generated.length,
       failCount: failures.length
     });
@@ -604,88 +973,64 @@ app.post('/api/v1/agent/collect', async (req, res) => {
   });
 
   try {
-    const body = req.body || {};
-    const roots = body.roots || body.diskRoots || (body.diskRoot ? [body.diskRoot] : []);
-    const indicators = body.indicators || body.rules || [];
-
-    if (!Array.isArray(roots) || roots.length === 0) {
-      return res.status(400).json({ success: false, error: '缺少 roots/diskRoots' });
-    }
-    if (!Array.isArray(indicators) || indicators.length === 0) {
-      return res.status(400).json({ success: false, error: '缺少 indicators/rules' });
-    }
-
-    const aiOptions = mergeAgentAIOptions({
-      provider: body.provider,
-      backend: body.backend,
-      baseUrl: body.baseUrl,
-      apiKey: body.apiKey,
-      model: body.modelName || body.aiModel,
-      temperature: body.temperature,
-      maxTokens: body.maxTokens,
-      timeout: body.timeout
-    });
-    aiOptions.signal = requestController.signal;
-
-    await pushAgentEventNow({
-      type: 'request',
-      message: '收到 Agent 采集请求',
-      roots,
-      indicatorCount: indicators.length,
-      ai: normalizeAIOptions(aiOptions)
-    });
-
-    const result = await runAgentCollection({
-      vendor: body.vendor || '',
-      deviceType: body.deviceType || '',
-      model: body.deviceModel || body.machineModel || body.model || '',
-      roots,
-      indicators,
-      aiOptions,
-      maxSteps: body.maxSteps,
-      maxCandidates: body.maxCandidates,
-      maxResultChars: body.maxResultChars,
-      dryRun: body.dryRun
-    }, {
-      onEvent: event => {
-        if (requestController.signal.aborted) return;
-        pushAgentEvent(event);
-      }
-    });
-
-    const excelResults = normalizeAgentResultsForExcel(result.results);
-    const successCount = excelResults.filter(item => item.success).length;
-    const scanLog = {
-      scan_time: new Date().toLocaleString('zh-CN'),
-      disk: roots.join(', '),
-      total_files: result.toolCalls
-        .filter(call => call.tool === 'search_files')
-        .reduce((sum, call) => sum + (call.result?.checked?.files || 0), 0),
-      success_count: successCount,
-      fail_count: excelResults.length - successCount,
-      total_indicators: excelResults.length,
-      duration: (result.durationMs / 1000).toFixed(2),
-      template_rules: indicators.length,
-      used_index: false,
-      collector: 'agent'
-    };
-
-    if (!body.dryRun) {
-      const outputPath = path.join(TEMP_DIR, 'MRI_Result.xlsx');
-      generateResultExcel(excelResults, scanLog, outputPath);
-    }
-
-    res.json({
-      ...result,
-      scanLog,
-      exportReady: !body.dryRun
-    });
+    const result = await executeAgentCollection(req.body || {}, requestController.signal);
+    res.json(result);
   } catch (err) {
     await pushAgentEventNow({
       type: 'error',
       message: err.message
     });
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/v1/agent/chat', async (req, res) => {
+  const requestController = new AbortController();
+  req.on('aborted', () => requestController.abort());
+  res.on('close', () => {
+    if (!res.writableEnded) requestController.abort();
+  });
+
+  try {
+    const body = req.body || {};
+    const message = String(body.message || body.instruction || '').trim();
+    const intent = detectAgentIntent(message);
+
+    await pushAgentEventNow({
+      type: 'chat_intent',
+      message: intent === 'collect' ? '识别为采集任务' : '识别为普通对话',
+      intent
+    });
+
+    if (intent === 'empty') {
+      return res.json({ success: true, mode: 'chat', intent, answer: '请输入要交流的问题，或明确告诉我开始采集。' });
+    }
+
+    if (intent === 'config') {
+      return res.json({ success: true, mode: 'chat', intent, answer: buildAgentConfigAnswer(body) });
+    }
+
+    if (intent === 'stop') {
+      return res.json({ success: true, mode: 'chat', intent, answer: '当前这条消息已收到。如果正在执行采集，请点击“停止”按钮中止正在运行的请求。' });
+    }
+
+    if (intent === 'collect') {
+      const preflightMessage = getAgentCollectPreflightMessage(body);
+      if (preflightMessage) {
+        return res.json({ success: true, mode: 'chat', intent: 'collect_preflight', answer: preflightMessage });
+      }
+      const result = await executeAgentCollection(body, requestController.signal);
+      return res.json({ ...result, mode: 'collect', intent });
+    }
+
+    const answer = await answerAgentChat(body, requestController.signal);
+    res.json({ success: true, mode: 'chat', intent, answer });
+  } catch (err) {
+    await pushAgentEventNow({
+      type: 'error',
+      message: err.message
+    });
+    res.status(500).json({ success: false, mode: 'chat', error: err.message });
   }
 });
 
@@ -713,19 +1058,37 @@ app.post('/api/v1/template/upload', upload.single('file'), (req, res) => {
       rules,
       count: rules.length,
       filename: decodedFilename,
-      format: rules[0].synonyms !== undefined ? 'new' : 'old'
+      format: 'task'
     });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
   }
 });
 
-// 下载模板示例（新格式）
+// 下载采集任务模板示例
 app.get('/api/v1/template/example', (req, res) => {
   try {
-    const outputPath = path.join(TEMP_DIR, 'MRI_Template_Example.xlsx');
+    const outputPath = path.join(TEMP_DIR, 'Collection_Task_Template.xlsx');
     generateTemplateExample(outputPath);
-    res.download(outputPath, 'MRI采集模板示例_v2.xlsx', (err) => {
+    res.download(outputPath, '采集任务模板.xlsx', (err) => {
+      if (err) {
+        res.status(500).json({ success: false, error: '下载失败' });
+      }
+      setTimeout(() => {
+        try { fs.unlinkSync(outputPath); } catch {}
+      }, 60000);
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 下载旧表/知识库导入模板示例
+app.get('/api/v1/raw-experience/template', (req, res) => {
+  try {
+    const outputPath = path.join(TEMP_DIR, 'Knowledge_Import_Template.xlsx');
+    generateKnowledgeImportTemplateExample(outputPath);
+    res.download(outputPath, '旧表知识库导入模板.xlsx', (err) => {
       if (err) {
         res.status(500).json({ success: false, error: '下载失败' });
       }
