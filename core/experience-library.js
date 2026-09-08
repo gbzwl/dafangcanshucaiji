@@ -270,15 +270,20 @@ export function getRawExperienceRecords(filters = {}) {
   let query = 'SELECT * FROM raw_experience WHERE 1=1';
   const params = [];
   if (filters.vendor) {
-    query += ' AND vendor = ?';
+    query += " AND (vendor = ? OR vendor = '')";
     params.push(filters.vendor);
   }
   if (filters.deviceType) {
-    query += ' AND device_type = ?';
-    params.push(filters.deviceType);
+    const normalizedType = String(filters.deviceType).toUpperCase() === 'MRI' ? 'MR' : String(filters.deviceType).toUpperCase();
+    if (normalizedType === 'MR') {
+      query += " AND UPPER(device_type) IN ('MR', 'MRI')";
+    } else {
+      query += ' AND UPPER(device_type) = ?';
+      params.push(normalizedType);
+    }
   }
   if (filters.model) {
-    query += ' AND model = ?';
+    query += " AND (model = ? OR model = '')";
     params.push(filters.model);
   }
   if (filters.indicator) {

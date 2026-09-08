@@ -1,5 +1,5 @@
 /**
- * Express 后端服务 - MRI 设备日志参数采集工具 v2.0
+ * Express backend for the CT/MR/DR collection Agent.
  * 新增：SQLite文件索引、三级匹配、设备模板管理、可信度评估
  */
 
@@ -30,7 +30,7 @@ import {
 } from './core/matcher.js';
 import { extractParameter, batchExtractWithProgress } from './core/extractor.js';
 import { parseTemplate, generateResultExcel, generateTemplateExample, generateKnowledgeImportTemplateExample } from './core/excel-handler.js';
-import { callAI, callAIStream, checkAIService, getAvailableBackends, extractJSON, testAIConnection, normalizeAIOptions } from './core/ai-service.js';
+import { callAI, callAIStream, getAvailableBackends, extractJSON, testAIConnection, normalizeAIOptions } from './core/ai-service.js';
 import { aiMatchParameter, aiBatchMatch } from './core/ai-matcher.js';
 import { discoverUnknownParameters, scanLogFiles, extractFieldsFromFile } from './core/ai-discoverer.js';
 import { generateTemplate, saveTemplateToExcel, extractAvailableFields } from './core/ai-template-gen.js';
@@ -56,9 +56,10 @@ import {
   deleteKnowledgeCandidate,
   clearKnowledgeCandidates
 } from './core/experience-library.js';
-import { listTools, executeTool } from './core/tools/agent-tools.js';
 import { validateKnowledgeCandidates } from './core/knowledge-validator.js';
 import { runAgentCollection } from './core/agent-runner.js';
+import { getIndicatorCatalog, getIndicatorTemplatePath, listIndicatorCatalogs, normalizeDeviceType } from './core/indicator-catalog.js';
+import { initAgentStore, listGeneratedTools } from './core/agent-store.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -90,13 +91,19 @@ if (!fs.existsSync(TEMPLATES_DIR)) fs.mkdirSync(TEMPLATES_DIR, { recursive: true
 if (!fs.existsSync(EXPERIENCE_DIR)) fs.mkdirSync(EXPERIENCE_DIR, { recursive: true });
 
 let agentRuntimeConfig = {
-  provider: 'ollama',
-  backend: 'ollama',
-  baseUrl: 'http://localhost:11434',
-  model: '',
+  provider: 'api',
+  backend: 'api',
+  baseUrl: process.env.AI_BASE_URL || 'https://api.deepseek.com',
+  model: process.env.AI_MODEL || 'deepseek-chat',
   apiKey: '',
   outputMode: 'auto'
 };
+
+initAgentStore(TEMP_DIR).then(() => {
+  console.log('Agent 任务与记忆数据库已初始化');
+}).catch(err => {
+  console.warn('Agent 数据库初始化失败:', err.message);
+});
 
 // 初始化采集经验库
 initExperienceDB().then(() => {
@@ -324,7 +331,7 @@ function normalizeKnowledgeGenerationError(error = '') {
   const text = String(error || '').trim();
   if (!text) return '未知错误';
   if (/api key|unauthorized|401|403|未输入|未提供/i.test(text)) return 'API Key 未配置或无效';
-  if (/not found|model.*not|模型.*不存在|未安装模型|404/i.test(text)) return '模型名称不正确或本地模型未安装';
+  if (/not found|model.*not|模型.*不存在|404/i.test(text)) return '模型名称不正确或 API 不支持该模型';
   if (/timeout|timed out|超时/i.test(text)) return '模型响应超时';
   if (/json|有效 JSON|格式/i.test(text)) return '模型没有按 JSON 格式返回';
   if (/fetch|connect|ECONNREFUSED|ENOTFOUND|network|连接/i.test(text)) return '模型服务连接失败';
@@ -357,13 +364,11 @@ function inferParserType(filePatterns = [], fileNamePatterns = []) {
 }
 
 function mergeAgentAIOptions(options = {}) {
-  const provider = options.provider || options.backend || agentRuntimeConfig.provider || agentRuntimeConfig.backend || 'ollama';
-  const usesRuntimeKey = !options.apiKey && provider !== 'ollama';
   return {
-    provider,
-    backend: options.backend || provider,
+    provider: 'api',
+    backend: 'api',
     baseUrl: options.baseUrl || agentRuntimeConfig.baseUrl || '',
-    apiKey: options.apiKey || (usesRuntimeKey ? agentRuntimeConfig.apiKey : ''),
+    apiKey: options.apiKey || agentRuntimeConfig.apiKey || '',
     model: options.model || options.aiModel || agentRuntimeConfig.model || '',
     timeout: options.timeout,
     temperature: options.temperature,
@@ -373,13 +378,12 @@ function mergeAgentAIOptions(options = {}) {
 }
 
 function normalizeAgentConfigInput(input = {}) {
-  const provider = input.provider || input.backend || 'ollama';
-  const baseUrl = input.baseUrl || input.url || defaultBaseUrl(provider);
+  const baseUrl = input.baseUrl || input.url || defaultBaseUrl();
   return {
-    provider,
-    backend: input.backend || provider,
+    provider: 'api',
+    backend: 'api',
     baseUrl,
-    model: input.model || input.aiModel || defaultModel(provider),
+    model: input.model || input.aiModel || defaultModel(),
     apiKey: input.apiKey || '',
     outputMode: input.outputMode || 'auto'
   };
@@ -397,18 +401,11 @@ function publicAgentConfig(config = agentRuntimeConfig) {
 }
 
 function defaultBaseUrl(provider) {
-  const normalized = String(provider || '').toLowerCase();
-  if (normalized === 'deepseek' || normalized === 'custom' || normalized === 'api') return 'https://api.deepseek.com';
-  if (normalized === 'openai') return 'https://api.openai.com';
-  if (normalized === 'ollama') return 'http://localhost:11434';
-  return '';
+  return process.env.AI_BASE_URL || 'https://api.deepseek.com';
 }
 
 function defaultModel(provider) {
-  const normalized = String(provider || '').toLowerCase();
-  if (normalized === 'deepseek' || normalized === 'custom' || normalized === 'api') return 'deepseek-chat';
-  if (normalized === 'openai') return 'gpt-4o-mini';
-  return '';
+  return process.env.AI_MODEL || 'deepseek-chat';
 }
 
 function normalizeAgentResultsForExcel(results = []) {
@@ -419,6 +416,9 @@ function normalizeAgentResultsForExcel(results = []) {
     matchedKeyword: item.matchedKeyword || item.matched_keyword || '',
     keywordMeaning: item.keywordMeaning || item.keyword_meaning || item.reason || '',
     match_line: item.evidence || item.match_line || '',
+    dataTimestamp: item.dataTimestamp || item.data_timestamp || '',
+    fileMtime: item.fileMtime || item.file_mtime || '',
+    evidenceLevel: item.evidenceLevel || item.evidence_level || 'NONE',
     confidence: item.confidence || 0,
     matchMethod: `Agent ${item.status || 'unknown'}`,
     success: item.status === 'success'
@@ -484,7 +484,7 @@ async function executeAgentCollection(body = {}, signal = null) {
     throw new Error('请先选择目标磁盘，然后再开始采集。');
   }
   if (!Array.isArray(request.indicators) || request.indicators.length === 0) {
-    throw new Error('请先导入采集任务模板，或在模板预览里添加至少一个指标。');
+    throw new Error('请先选择 CT、MR 或 DR，并保留至少一个采集指标。');
   }
 
   const aiOptions = mergeAgentAIOptions({
@@ -533,9 +533,8 @@ async function executeAgentCollection(body = {}, signal = null) {
   const scanLog = {
     scan_time: new Date().toLocaleString('zh-CN'),
     disk: request.roots.join(', '),
-    total_files: result.toolCalls
-      .filter(call => call.tool === 'search_files')
-      .reduce((sum, call) => sum + (call.result?.checked?.files || 0), 0),
+    total_files: result.toolCalls.reduce((sum, call) => sum
+      + Number(call.result?.result?.checkedFiles || call.result?.result?.checked?.files || 0), 0),
     success_count: successCount,
     fail_count: excelResults.length - successCount,
     total_indicators: excelResults.length,
@@ -546,7 +545,7 @@ async function executeAgentCollection(body = {}, signal = null) {
   };
 
   if (!request.dryRun) {
-    const outputPath = path.join(TEMP_DIR, 'MRI_Result.xlsx');
+    const outputPath = path.join(TEMP_DIR, 'Collection_Result.xlsx');
     generateResultExcel(excelResults, scanLog, outputPath);
   }
 
@@ -583,7 +582,7 @@ function getAgentCollectPreflightMessage(body = {}) {
   const { roots, indicators } = normalizeAgentCollectionBody(body);
   const missing = [];
   if (!Array.isArray(roots) || roots.length === 0) missing.push('目标磁盘');
-  if (!Array.isArray(indicators) || indicators.length === 0) missing.push('采集任务模板或指标');
+  if (!Array.isArray(indicators) || indicators.length === 0) missing.push('设备类型和采集指标');
   if (missing.length === 0) return '';
   return `现在还不能开始采集，请先补充：${missing.join('、')}。`;
 }
@@ -601,9 +600,7 @@ function buildAgentConfigAnswer(body = {}) {
     `当前配置的大模型服务商是 ${normalized.provider}。`,
     `模型名称是 ${normalized.model || '未填写'}。`,
     `Base URL 是 ${normalized.baseUrl || '未填写'}。`,
-    normalized.provider === 'ollama'
-      ? '这是本地 Ollama 模型，需要模型名称和本机已安装模型完全一致。'
-      : `API Key ${normalized.hasApiKey ? '已在当前请求中提供' : '未提供'}。`
+    `API Key ${normalized.hasApiKey ? '已配置' : '未配置'}。`
   ].join('\n');
 }
 
@@ -659,20 +656,50 @@ ${body.agentProfile || '未设置'}
 app.get('/api/v1/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '2.0.0',
+    version: '4.0.0',
     platform: process.platform,
     indexReady
   });
 });
 
 // 获取可用磁盘列表
+app.get('/api/v1/indicator-catalogs', (req, res) => {
+  try {
+    res.json({ success: true, catalogs: listIndicatorCatalogs(TEMPLATES_DIR) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/v1/indicator-catalogs/:deviceType', (req, res) => {
+  try {
+    const deviceType = normalizeDeviceType(req.params.deviceType);
+    const indicators = getIndicatorCatalog(TEMPLATES_DIR, deviceType);
+    res.json({ success: true, deviceType, indicators, count: indicators.length });
+  } catch (error) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/v1/indicator-catalogs/:deviceType/download', (req, res) => {
+  try {
+    const deviceType = normalizeDeviceType(req.params.deviceType);
+    res.download(getIndicatorTemplatePath(TEMPLATES_DIR, deviceType), `${deviceType}采集任务模板.xlsx`);
+  } catch (error) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/api/v1/tools', (req, res) => {
-  res.json({ success: true, tools: listTools() });
+  try {
+    res.json({ success: true, tools: listGeneratedTools({ status: req.query.status || '', limit: req.query.limit || 100 }) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 app.post('/api/v1/tools/:name', async (req, res) => {
-  const result = await executeTool(req.params.name, req.body || {});
-  res.status(result.success === false ? 400 : 200).json(result);
+  res.status(410).json({ success: false, error: '固定工具调用接口已停用，工具由外部 API 在 Agent 任务中动态生成' });
 });
 
 app.get('/api/v1/agent/config', (req, res) => {
@@ -716,7 +743,7 @@ app.post('/api/v1/raw-experience/import', upload.single('file'), async (req, res
     const decodedFilename = iconv.decode(Buffer.from(req.file.originalname, 'latin1'), 'utf8');
     const result = importRawExperienceWorkbook(req.file.buffer, {
       vendor: req.body.vendor || '',
-      deviceType: req.body.deviceType || '',
+      deviceType: normalizeDeviceType(req.body.deviceType) || req.body.deviceType || '',
       model: req.body.model || '',
       sourceFile: decodedFilename
     });
@@ -1463,7 +1490,7 @@ app.post('/api/v1/collect', async (req, res) => {
     };
 
     // 第三步：生成结果 Excel
-    const outputPath = path.join(TEMP_DIR, 'MRI_Result.xlsx');
+    const outputPath = path.join(TEMP_DIR, 'Collection_Result.xlsx');
     generateResultExcel(results, scanLog, outputPath);
 
     res.json({
@@ -1645,61 +1672,23 @@ app.post('/api/v1/extract', (req, res) => {
 
 // 下载结果文件
 app.get('/api/v1/result/download', (req, res) => {
-  const filePath = path.join(TEMP_DIR, 'MRI_Result.xlsx');
+  const filePath = path.join(TEMP_DIR, 'Collection_Result.xlsx');
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ success: false, error: '结果文件不存在，请先执行采集' });
   }
-  res.download(filePath, 'MRI采集结果_v2.xlsx');
+  res.download(filePath, '设备参数采集结果.xlsx');
 });
 
 // ==================== AI 功能 API ====================
 
 // 获取 AI 服务状态
 app.get('/api/v1/ai/status', async (req, res) => {
-  try {
-    const backends = getAvailableBackends();
-    const status = await checkAIService('ollama');
-
-    res.json({
-      success: true,
-      backends,
-      agentConfig: publicAgentConfig(agentRuntimeConfig),
-      ollama: status,
-      deepseek: {
-        available: !!(process.env.DEEPSEEK_API_KEY || (agentRuntimeConfig.provider === 'deepseek' && agentRuntimeConfig.apiKey)),
-        local: false
-      }
-    });
-  } catch (err) {
-    res.json({
-      success: true,
-      backends: getAvailableBackends(),
-      agentConfig: publicAgentConfig(agentRuntimeConfig),
-      ollama: { available: false, error: err.message },
-      deepseek: {
-        available: !!(process.env.DEEPSEEK_API_KEY || (agentRuntimeConfig.provider === 'deepseek' && agentRuntimeConfig.apiKey)),
-        local: false
-      }
-    });
-  }
-});
-
-// 获取 Ollama 本地已安装的模型列表
-app.get('/api/v1/ai/models', async (req, res) => {
-  try {
-    const response = await fetch('http://localhost:11434/api/tags', {
-      signal: AbortSignal.timeout(5000)
-    });
-    const data = await response.json();
-    const models = (data.models || []).map(m => ({
-      name: m.name,
-      size: (m.size / 1024 / 1024 / 1024).toFixed(1) + ' GB',
-      modified: m.modified_at ? new Date(m.modified_at).toLocaleDateString('zh-CN') : ''
-    }));
-    res.json({ success: true, models, count: models.length });
-  } catch (error) {
-    res.json({ success: false, error: '无法连接 Ollama，请确认已安装并运行', models: [] });
-  }
+  res.json({
+    success: true,
+    backends: getAvailableBackends(),
+    agentConfig: publicAgentConfig(agentRuntimeConfig),
+    api: { available: !!agentRuntimeConfig.apiKey, local: false }
+  });
 });
 
 // AI 参数匹配
@@ -2235,6 +2224,6 @@ app.get('*', (req, res) => {
 
 // 启动服务
 app.listen(PORT, () => {
-  console.log(`大放设备参数采集程序 v3.0 已启动: http://localhost:${PORT}`);
+  console.log(`大放设备参数采集程序 v4.0 已启动: http://localhost:${PORT}`);
   console.log(`平台: ${process.platform}`);
 });

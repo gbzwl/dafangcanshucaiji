@@ -1,667 +1,410 @@
+import fs from 'fs';
 import path from 'path';
 import { callAIStream, extractJSON } from './ai-service.js';
-import { executeTool, listTools } from './tools/agent-tools.js';
 import { getKnowledgeCandidates } from './experience-library.js';
+import { executeGeneratedTool } from './dynamic-tool-runner.js';
+import {
+  appendAgentEvent,
+  createAgentTask,
+  recordGeneratedToolRun,
+  retrieveAgentMemories,
+  saveAgentMemory,
+  saveGeneratedTool,
+  updateAgentTask
+} from './agent-store.js';
 
-const ALLOWED_TOOLS = new Set([
-  'search_files',
-  'dynamic_scan_plan',
-  'get_file_meta',
-  'read_head',
-  'read_tail',
-  'read_sample',
-  'search_text',
-  'parse_xml',
-  'count_rows',
-  'first_last_rows',
-  'gunzip_preview'
-]);
-
-const FILE_ARG_TOOLS = new Set([
-  'get_file_meta',
-  'read_head',
-  'read_tail',
-  'read_sample',
-  'search_text',
-  'parse_xml',
-  'count_rows',
-  'first_last_rows',
-  'gunzip_preview'
-]);
-
-const DEFAULT_MAX_STEPS = 10;
-const DEFAULT_MAX_CANDIDATES = 8;
-const DEFAULT_MAX_RESULT_CHARS = 7000;
-const DEFAULT_MAX_TOKEN_OUTPUT = 1400;
+const DEFAULT_MAX_STEPS = 12;
+const DEFAULT_MAX_CANDIDATES = 12;
+const DEFAULT_MAX_RESULT_CHARS = 12000;
+const DEFAULT_MAX_TOKEN_OUTPUT = 5000;
 
 export async function runAgentCollection(request = {}, hooks = {}) {
   const roots = normalizeRoots(request.roots || request.diskRoots || request.root || request.diskRoot);
   const indicators = normalizeIndicators(request.indicators || request.rules);
-
-  if (roots.length === 0) throw new Error('roots/diskRoots is required');
-  if (indicators.length === 0) throw new Error('indicators/rules is required');
+  if (!roots.length) throw new Error('请先选择目标磁盘');
+  if (!indicators.length) throw new Error('当前设备类型没有可采集指标');
 
   const startedAt = Date.now();
   const context = {
-    vendor: request.vendor || '',
-    deviceType: request.deviceType || '',
-    model: request.model || '',
+    vendor: String(request.vendor || '').trim(),
+    deviceType: String(request.deviceType || '').trim().toUpperCase(),
+    model: String(request.model || '').trim(),
     roots,
     aiOptions: request.aiOptions || {},
-    maxSteps: clampNumber(request.maxSteps, 1, 30, DEFAULT_MAX_STEPS),
-    maxCandidates: clampNumber(request.maxCandidates, 0, 30, DEFAULT_MAX_CANDIDATES),
-    maxResultChars: clampNumber(request.maxResultChars, 1000, 30000, DEFAULT_MAX_RESULT_CHARS),
-    maxDurationMs: clampNumber(request.maxDurationMs, 10000, 30 * 60 * 1000, 5 * 60 * 1000),
+    maxSteps: clampNumber(request.maxSteps, 1, 40, DEFAULT_MAX_STEPS),
+    maxCandidates: clampNumber(request.maxCandidates, 1, 50, DEFAULT_MAX_CANDIDATES),
+    maxResultChars: clampNumber(request.maxResultChars, 2000, 50000, DEFAULT_MAX_RESULT_CHARS),
+    maxDurationMs: clampNumber(request.maxDurationMs, 30000, 2 * 60 * 60 * 1000, 20 * 60 * 1000),
     agentProfile: String(request.agentProfile || '').trim(),
-    dryRun: !!request.dryRun
+    dryRun: !!request.dryRun,
+    signal: request.aiOptions?.signal
   };
   context.deadline = startedAt + context.maxDurationMs;
+  context.taskId = safeCreateTask({ ...context, indicators });
 
   const results = [];
   const trace = [];
   const toolCalls = [];
+  const sharedDiscoveries = [];
+  await emit(hooks, trace, context, { type: 'start', taskId: context.taskId, message: `开始采集 ${indicators.length} 个指标`, totalIndicators: indicators.length, roots });
 
-  await emit(hooks, trace, {
-    type: 'start',
-    message: `开始 Agent 采集：${indicators.length} 个指标，${roots.length} 个根目录`,
-    totalIndicators: indicators.length,
-    roots
-  });
+  try {
+    context.taskPlan = context.dryRun
+      ? createFallbackPlan(indicators)
+      : await createTaskPlan(indicators, context, hooks, trace);
+    await emit(hooks, trace, context, { type: 'plan_ready', taskId: context.taskId, groups: context.taskPlan.groups || [], strategy: context.taskPlan.strategy || '' });
 
-  for (let i = 0; i < indicators.length; i++) {
-    if (Date.now() > context.deadline) {
-      results.push(...indicators.slice(i).map(indicator => ({
-        indicator: indicator.indicator,
-        value: '',
-        filePath: '',
-        matchedKeyword: '',
-        keywordMeaning: '',
-        evidence: '',
-        confidence: 0,
-        status: 'failed',
-        reason: 'Agent 任务达到最大时长'
-      })));
-      break;
+    for (let index = 0; index < indicators.length; index++) {
+      if (context.signal?.aborted) throw new Error('Agent 采集已停止');
+      if (Date.now() > context.deadline) {
+        results.push(...indicators.slice(index).map(item => emptyResult(item, 'failed', '任务达到最长执行时间')));
+        break;
+      }
+
+      const indicator = indicators[index];
+      safeUpdateTask(context.taskId, { currentIndicator: indicator.indicatorId, currentStep: 0 });
+      await emit(hooks, trace, context, { type: 'indicator_start', indicator: indicator.indicator, indicatorId: indicator.indicatorId, index: index + 1, total: indicators.length });
+
+      const memory = loadRelevantMemory(indicator, context);
+      await emit(hooks, trace, context, { type: 'knowledge', indicator: indicator.indicator, indicatorId: indicator.indicatorId, count: memory.length });
+      if (context.dryRun) {
+        results.push({ ...emptyResult(indicator, 'dry_run', '仅生成决策上下文'), prompt: buildAgentPrompt(indicator, memory, context, [], sharedDiscoveries) });
+        continue;
+      }
+
+      const result = await runIndicator(indicator, memory, context, hooks, trace, toolCalls, sharedDiscoveries);
+      results.push(result);
+      rememberResult(result, indicator, context);
+      await emit(hooks, trace, context, { type: 'indicator_complete', indicator: indicator.indicator, indicatorId: indicator.indicatorId, status: result.status, confidence: result.confidence });
     }
 
-    const indicator = indicators[i];
-    await emit(hooks, trace, {
-      type: 'indicator_start',
-      indicator: indicator.indicator,
-      index: i + 1,
-      total: indicators.length
-    });
-
-    const candidates = loadKnowledgeCandidates(indicator, context);
-    await emit(hooks, trace, {
-      type: 'knowledge',
-      indicator: indicator.indicator,
-      count: candidates.length
-    });
-
-    if (context.dryRun) {
-      const prompt = buildAgentPrompt(indicator, candidates, context, []);
-      results.push(createPendingResult(indicator, 'dry_run', prompt));
-      continue;
-    }
-
-    const indicatorResult = await runIndicatorAgent(indicator, candidates, context, hooks, trace, toolCalls);
-    results.push(indicatorResult);
-
-    await emit(hooks, trace, {
-      type: 'indicator_complete',
-      indicator: indicator.indicator,
-      status: indicatorResult.status,
-      confidence: indicatorResult.confidence
-    });
+    const output = { success: true, taskId: context.taskId, results, trace, toolCalls, durationMs: Date.now() - startedAt };
+    safeUpdateTask(context.taskId, { status: 'completed', result: output });
+    await emit(hooks, trace, context, { type: 'complete', taskId: context.taskId, message: 'Agent 采集完成', durationMs: output.durationMs, successCount: results.filter(item => item.status === 'success').length, failCount: results.filter(item => item.status !== 'success').length });
+    return output;
+  } catch (error) {
+    safeUpdateTask(context.taskId, { status: context.signal?.aborted ? 'cancelled' : 'failed', result: { error: error.message, results } });
+    throw error;
   }
-
-  await emit(hooks, trace, {
-    type: 'complete',
-    message: 'Agent 采集完成',
-    durationMs: Date.now() - startedAt,
-    successCount: results.filter(item => item.status === 'success').length,
-    failCount: results.filter(item => item.status !== 'success').length
-  });
-
-  return {
-    success: true,
-    results,
-    trace,
-    toolCalls,
-    durationMs: Date.now() - startedAt
-  };
 }
 
-async function runIndicatorAgent(indicator, candidates, context, hooks, trace, toolCalls) {
+async function runIndicator(indicator, memory, context, hooks, trace, toolCalls, sharedDiscoveries) {
   const observations = [];
   let lastModelText = '';
-  let parseErrorCount = 0;
+  let parseErrors = 0;
 
   for (let step = 1; step <= context.maxSteps; step++) {
-    if (Date.now() > context.deadline) {
-      return {
-        indicator: indicator.indicator,
-        value: '',
-        filePath: '',
-        matchedKeyword: '',
-        keywordMeaning: '',
-        evidence: '',
-        confidence: 0,
-        status: 'failed',
-        reason: 'Agent 任务达到最大时长',
-        observations: observations.slice(-5),
-        rawModelText: truncate(lastModelText, 2000)
-      };
-    }
+    if (context.signal?.aborted) throw new Error('Agent 采集已停止');
+    if (Date.now() > context.deadline) return emptyResult(indicator, 'failed', '任务达到最长执行时间');
+    safeUpdateTask(context.taskId, { currentIndicator: indicator.indicatorId, currentStep: step });
+    await emit(hooks, trace, context, { type: 'model_step', indicator: indicator.indicator, indicatorId: indicator.indicatorId, step, maxSteps: context.maxSteps });
 
-    await emit(hooks, trace, {
-      type: 'model_step',
-      indicator: indicator.indicator,
-      step,
-      maxSteps: context.maxSteps
+    const prompt = buildAgentPrompt(indicator, memory, context, observations, sharedDiscoveries);
+    let streamed = '';
+    const aiResult = await callAIStream(prompt, {
+      ...context.aiOptions,
+      maxTokens: context.aiOptions.maxTokens || DEFAULT_MAX_TOKEN_OUTPUT,
+      temperature: context.aiOptions.temperature ?? 0.15,
+      formatJson: true
+    }, (token, meta = {}) => {
+      if (meta.type === 'content') streamed += token;
+      hooks.onEvent?.({ type: meta.type === 'reasoning' ? 'model_reasoning_delta' : 'model_delta', indicator: indicator.indicator, indicatorId: indicator.indicatorId, step, content: token });
     });
 
-    const prompt = buildAgentPrompt(indicator, candidates, context, observations);
-    let raw = '';
-    const aiResult = await callAIStream(
-      prompt,
-      {
-        ...context.aiOptions,
-        maxTokens: context.aiOptions.maxTokens || DEFAULT_MAX_TOKEN_OUTPUT,
-        temperature: context.aiOptions.temperature ?? 0.2,
-        formatJson: context.aiOptions.formatJson ?? true
-      },
-      token => {
-        raw += token;
-        hooks.onEvent?.({
-          type: 'model_delta',
-          indicator: indicator.indicator,
-          step,
-          content: token
-        });
-      }
-    );
-
-    lastModelText = aiResult.content || raw;
+    lastModelText = aiResult.content || streamed;
     let action = extractJSON(lastModelText);
+    if (!action) action = await repairAction(lastModelText, indicator, context, hooks, trace, step);
     if (!action || typeof action !== 'object') {
-      action = await repairModelAction(lastModelText, indicator, context, hooks, trace, step);
-    }
-    if (!action || typeof action !== 'object') {
-      parseErrorCount++;
-      observations.push({
-        type: 'parse_error',
-        content: truncate(lastModelText, 1200),
-        message: '模型没有返回有效 JSON'
-      });
-      await emit(hooks, trace, {
-        type: 'parse_error',
-        indicator: indicator.indicator,
-        step,
-        message: '模型没有返回有效 JSON'
-      });
-      if (parseErrorCount >= 2) {
-        return {
-          indicator: indicator.indicator,
-          value: '',
-          filePath: '',
-          matchedKeyword: '',
-          keywordMeaning: '',
-          evidence: '',
-          confidence: 0,
-          status: 'failed',
-          reason: '模型连续没有按工具调用 JSON 协议返回，已停止当前指标',
-          observations: observations.slice(-5),
-          rawModelText: truncate(lastModelText, 2000)
-        };
-      }
+      parseErrors++;
+      await emit(hooks, trace, context, { type: 'parse_error', indicator: indicator.indicator, indicatorId: indicator.indicatorId, step, message: '模型没有返回有效的 Agent JSON' });
+      if (parseErrors >= 2) return emptyResult(indicator, 'failed', '外部 API 连续返回无效格式');
       continue;
     }
-    parseErrorCount = 0;
+    parseErrors = 0;
 
     if (action.type === 'final') {
-      return normalizeFinalResult(indicator, action.result || action, observations);
+      return validateFinalResult(indicator, action.result || action, context, observations);
     }
-
-    if (action.type === 'tool_request') {
-      await emit(hooks, trace, {
-        type: 'tool_request',
-        indicator: indicator.indicator,
-        step,
-        tool: action.tool || action.name || '',
-        reason: action.reason || action.thought || '',
-        inputSchema: action.input_schema || action.inputSchema || {},
-        expectedOutput: action.expected_output || action.expectedOutput || ''
-      });
-      return {
-        indicator: indicator.indicator,
-        value: '',
-        filePath: '',
-        matchedKeyword: '',
-        keywordMeaning: action.reason || action.thought || '',
-        evidence: '',
-        confidence: 0,
-        status: 'needs_tool',
-        reason: `现有工具不足，需要新增工具：${action.tool || action.name || '未命名工具'}`,
-        toolRequest: action
-      };
-    }
-
-    if (action.type !== 'tool_call') {
-      observations.push({
-        type: 'protocol_error',
-        action: truncate(JSON.stringify(action), 1200),
-        message: '模型返回了未知 action type'
-      });
+    if (action.type !== 'code_call') {
+      observations.push({ type: 'protocol_error', message: `不支持的动作：${action.type || 'unknown'}` });
       continue;
     }
 
-    const toolName = String(action.tool || '').trim();
-    const args = action.args || {};
-    await emit(hooks, trace, {
-      type: 'tool_call',
-      indicator: indicator.indicator,
-      step,
-      tool: toolName,
-      thought: action.thought || '',
-      args: redactToolArgs(args)
+    const toolName = String(action.name || action.tool || `explore_${indicator.indicatorId}_${step}`).trim();
+    const sourceCode = String(action.code || '').trim();
+    const savedTool = safeSaveTool({
+      name: toolName,
+      description: action.thought || action.description || '',
+      sourceCode,
+      inputSchema: action.input_schema || {},
+      outputSchema: action.output_schema || {},
+      sourceModel: context.aiOptions.model || '',
+      sourceTaskId: context.taskId
     });
 
-    const toolResult = await runSafeTool(toolName, args, context, observations);
-    const compactResult = compactToolResult(toolName, toolResult, context.maxResultChars);
-    const callRecord = {
-      indicator: indicator.indicator,
-      step,
-      tool: toolName,
-      args: redactToolArgs(args),
-      result: compactResult
-    };
-
-    toolCalls.push(callRecord);
-    observations.push(callRecord);
-
-    await emit(hooks, trace, {
-      type: 'tool_result',
-      indicator: indicator.indicator,
-      step,
-      tool: toolName,
-      success: toolResult.success !== false,
-      summary: summarizeToolResult(toolName, compactResult)
+    await emit(hooks, trace, context, { type: 'code_call', indicator: indicator.indicator, indicatorId: indicator.indicatorId, step, tool: toolName, thought: action.thought || '', args: action.args || {} });
+    const startedAt = Date.now();
+    const executed = await executeGeneratedTool({ code: sourceCode, args: action.args || {} }, {
+      roots: context.roots,
+      timeoutMs: Math.min(120000, Math.max(10000, context.deadline - Date.now())),
+      maxOutputChars: context.maxResultChars * 2,
+      signal: context.signal
     });
+    const compact = compactResult(executed, context.maxResultChars);
+    safeRecordToolRun(savedTool?.id, { success: executed.success !== false, durationMs: Date.now() - startedAt, error: executed.error || '' });
+
+    const record = { indicator: indicator.indicator, indicatorId: indicator.indicatorId, step, tool: toolName, args: action.args || {}, result: compact };
+    observations.push(record);
+    toolCalls.push(record);
+    if (executed.success && sharedDiscoveries.length < 30) sharedDiscoveries.push({ indicator: indicator.indicator, tool: toolName, result: compact });
+    await emit(hooks, trace, context, { type: 'code_result', indicator: indicator.indicator, indicatorId: indicator.indicatorId, step, tool: toolName, success: executed.success !== false, summary: summarizeCodeResult(compact) });
   }
+  return { ...emptyResult(indicator, 'failed', '达到最大决策步数，模型仍未形成结论'), rawModelText: truncate(lastModelText, 2000) };
+}
 
+async function createTaskPlan(indicators, context, hooks, trace) {
+  await emit(hooks, trace, context, { type: 'planning', taskId: context.taskId, message: '正在分析整批指标并制定共享探索计划' });
+  const prompt = `你是医疗设备参数采集任务规划器。根据整批指标制定共享探索计划，避免每个指标重复扫描磁盘。
+只返回 JSON，不要生成文件路径或结果值，不要假设某个厂商一定使用固定目录。
+
+设备类型：${context.deviceType}
+厂商：${context.vendor || '未知'}
+型号：${context.model || '未知'}
+根目录数量：${context.roots.length}
+指标：${JSON.stringify(indicators.map(item => ({ id: item.indicatorId, name: item.indicator, referenceCode: item.indicatorCode })))}
+
+返回格式：
+{
+  "strategy": "整体探索策略",
+  "groups": [
+    {"name":"分组名称","indicatorIds":["指标ID"],"likelyFileKinds":["log","xml"],"sharedSearchIdeas":["英文文件名或目录语义"]}
+  ],
+  "qualityNotes": ["需要特别验证的同源关系或时间要求"]
+}`;
+  try {
+    let content = '';
+    const result = await callAIStream(prompt, { ...context.aiOptions, maxTokens: 1800, temperature: 0.1, formatJson: true }, (token, meta = {}) => {
+      if (meta.type === 'content') content += token;
+      if (meta.type === 'reasoning') hooks.onEvent?.({ type: 'model_reasoning_delta', step: 0, content: token });
+    });
+    return extractJSON(result.content || content) || createFallbackPlan(indicators);
+  } catch (error) {
+    await emit(hooks, trace, context, { type: 'planning_fallback', message: `整批计划生成失败，使用指标顺序继续：${error.message}` });
+    return createFallbackPlan(indicators);
+  }
+}
+
+function createFallbackPlan(indicators) {
   return {
-    indicator: indicator.indicator,
-    value: '',
-    filePath: '',
-    matchedKeyword: '',
-    keywordMeaning: '',
-    evidence: '',
-    confidence: 0,
-    status: 'failed',
-    reason: '达到最大 Agent 步数，模型未给出最终结果',
-    observations: observations.slice(-5),
-    rawModelText: truncate(lastModelText, 2000)
+    strategy: '按指标顺序探索，并复用前面步骤已经发现的目录和文件。',
+    groups: [{ name: '全部指标', indicatorIds: indicators.map(item => item.indicatorId), likelyFileKinds: [], sharedSearchIdeas: [] }],
+    qualityNotes: []
   };
 }
 
-async function runSafeTool(toolName, args, context, observations = []) {
-  if (!ALLOWED_TOOLS.has(toolName)) {
-    return { success: false, error: `tool is not allowed: ${toolName}` };
-  }
+function buildAgentPrompt(indicator, memory, context, observations, sharedDiscoveries) {
+  return `${context.agentProfile || '你是医疗设备参数采集 Agent，负责理解指标、编写只读探索代码、判断证据并输出结论。'}
 
-  const safeArgs = sanitizeToolArgs(toolName, args, context, observations);
-  if (safeArgs.success === false) return safeArgs;
+不可改变的边界：
+- 你负责分析和生成代码，本地程序负责执行。不得臆造文件、数值或证据。
+- 代码只能读取允许根目录，禁止写入、删除、改名文件，禁止启动其他进程或访问网络。
+- test、template、demo、sample、systemstatus、testProtConfig 等文件不得作为正式证据。
+- 没有真实文件证据时必须返回 not_found 或 needs_review。
 
-  return executeTool(toolName, safeArgs);
-}
-
-function sanitizeToolArgs(toolName, args = {}, context, observations = []) {
-  const safe = { ...args };
-
-  if (toolName === 'search_files') {
-    safe.roots = context.roots;
-    safe.maxFiles = clampNumber(safe.maxFiles, 1, 5000, 1200);
-    safe.maxResults = clampNumber(safe.maxResults, 1, 200, 50);
-    safe.patterns = normalizeList(safe.patterns || safe.pattern || safe.query)
-      .map(normalizeSearchPattern)
-      .filter(Boolean)
-      .slice(0, 20);
-    safe.extensions = normalizeList(safe.extensions || safe.exts).slice(0, 20);
-    if (safe.patterns.length === 0 && safe.extensions.length === 0) {
-      return {
-        success: false,
-        error: 'search_files 需要提供文件名、路径片段、通配符或扩展名，不能无条件全盘枚举'
-      };
-    }
-    delete safe.root;
-    delete safe.diskRoot;
-    delete safe.diskRoots;
-    return safe;
-  }
-
-  if (FILE_ARG_TOOLS.has(toolName)) {
-    if (toolName === 'search_text') {
-      safe.query = safe.query || safe.keyword || safe.text || safe.content || '';
-      delete safe.text;
-      delete safe.content;
-    }
-
-    const file = safe.file || safe.path || inferFileFromObservations(observations, safe);
-    if (!file) return { success: false, error: 'file/path is required' };
-    if (!isPathInsideRoots(file, context.roots)) {
-      return { success: false, error: 'file path is outside allowed roots' };
-    }
-    safe.file = file;
-    safe.lines = clampNumber(safe.lines, 1, 500, safe.lines || 120);
-    safe.maxMatches = clampNumber(safe.maxMatches, 1, 100, safe.maxMatches || 20);
-    safe.maxBytes = clampNumber(safe.maxBytes, 1024, 16 * 1024 * 1024, safe.maxBytes || undefined);
-    safe.maxLineLength = clampNumber(safe.maxLineLength, 100, 2000, safe.maxLineLength || 500);
-    return safe;
-  }
-
-  return safe;
-}
-
-function inferFileFromObservations(observations = [], args = {}) {
-  const patterns = normalizeList(args.patterns || args.pattern || args.filePattern)
-    .map(normalizeSearchPattern)
-    .filter(Boolean);
-
-  for (const observation of [...observations].reverse()) {
-    const files = observation.result?.files || [];
-    if (!Array.isArray(files) || files.length === 0) continue;
-    if (patterns.length === 0) return files[0].path;
-
-    const matched = files.find(file => {
-      const filePath = String(file.path || '').replace(/\\/g, '/').toLowerCase();
-      const name = String(file.name || '').toLowerCase();
-      return patterns.some(pattern => {
-        const normalized = String(pattern || '').replace(/\\/g, '/').toLowerCase();
-        return filePath.includes(normalized) || name.includes(normalized);
-      });
-    });
-    if (matched) return matched.path;
-  }
-
-  return '';
-}
-
-function buildAgentPrompt(indicator, candidates, context, observations) {
-  return `${context.agentProfile || '你是医疗设备日志采集 Agent。你不能直接访问磁盘，只能通过程序工具采集证据。'}
-
-任务：
+当前任务：
+- 设备类型：${context.deviceType}
 - 厂商：${context.vendor || '未知'}
-- 设备类型：${context.deviceType || '未知'}
 - 型号：${context.model || '未知'}
-- 当前指标：${indicator.indicator}
-- 指标标识：${indicator.indicatorCode || indicator.indicator_code || ''}
-- 采集任务模板只定义要采集的指标，不预设文件路径和搜索关键字。
+- 指标 ID：${indicator.indicatorId}
+- 中文指标：${indicator.indicator}
+- 参考英文标识：${indicator.indicatorCode || '无，仅供推测，不是固定字段'}
 - 允许根目录：${context.roots.join(' | ')}
 
-可用工具：
-${listTools().map(tool => `- ${tool.name}: ${tool.description}`).join('\n')}
+整批任务共享计划：
+${JSON.stringify(context.taskPlan || {}, null, 2)}
 
-知识库候选：
-${JSON.stringify(candidates, null, 2)}
+相关前置记忆：
+${JSON.stringify(memory, null, 2)}
 
-已观察到的工具结果：
+本任务其他指标已经发现的内容：
+${JSON.stringify(sharedDiscoveries.slice(-8), null, 2)}
+
+当前指标已经执行的步骤：
 ${JSON.stringify(observations.slice(-8), null, 2)}
 
-你必须只返回 JSON，不要 Markdown，不要额外解释。
-
-如果还需要查看文件，返回：
+每次只能返回一个 JSON 对象。需要探索磁盘时返回：
 {
-  "type": "tool_call",
-  "thought": "简短说明为什么调用这个工具",
-  "tool": "search_files",
-  "args": {
-    "patterns": ["文件名或路径片段"],
-    "extensions": [".log", ".xml", ".txt"],
-    "maxFiles": 1200,
-    "maxResults": 30
-  }
+  "type": "code_call",
+  "name": "简短的英文工具名",
+  "thought": "本次真实探索目的",
+  "args": {"maxFiles": 5000, "maxResults": 100},
+  "code": "JavaScript 函数体代码"
 }
 
-如果现有工具不足，返回：
-{
-  "type": "tool_request",
-  "tool": "建议新增的工具名",
-  "reason": "为什么现有工具无法完成",
-  "input_schema": {},
-  "expected_output": "希望工具返回什么"
-}
+代码运行环境：
+- 已提供 fs、path、zlib、readline 和 context。
+- context.roots 是允许读取的根目录；context.args 是本次参数；context.limits 包含 maxFiles、maxReadBytes、maxResults。
+- 代码位于 async function generatedTool(context) 内，最后必须 return 可 JSON 序列化结果。
+- 允许使用 fs.promises、createReadStream、readdir、stat 和 readline，必须限制文件数、读取量和结果数。
+- 先探索高概率目录和文件名，再读取小片段；大日志优先读取尾部或逐行搜索。
+- 不要在代码中写死当前机器盘符，必须从 context.roots 开始。
 
-如果已经可以给出采集结论，返回：
+形成结论时返回：
 {
   "type": "final",
   "result": {
     "indicator": "${indicator.indicator}",
-    "value": "",
-    "filePath": "",
-    "matchedKeyword": "",
-    "keywordMeaning": "",
-    "evidence": "",
+    "value": "采集值",
+    "filePath": "真实完整路径",
+    "matchedKeyword": "实际字段或 selector",
+    "keywordMeaning": "中文含义和判断说明",
+    "evidence": "来自文件的原始证据片段",
+    "dataTimestamp": "数据时间，无法确定则为空",
+    "fileMtime": "文件修改时间",
+    "evidenceLevel": "STRONG|MEDIUM|WEAK|NONE",
     "confidence": 0,
-    "status": "success",
-    "reason": ""
+    "status": "success|needs_review|not_found",
+    "reason": "结论理由"
   }
+}`;
 }
 
-规则：
-- 优先参考知识库候选；如果没有候选，根据中文指标名和指标标识推测英文关键字、文件名和路径片段。
-- 指标标识只是参考线索，不代表日志中一定存在完全相同字段。
-- 日志中一般不会出现中文，搜索关键字必须使用英文、数字或符号。
-- “关键字及含义/证据摘要”属于知识库说明，不要直接整段当作搜索关键字，应从中提炼英文字段、文件名、数值模式或 XML selector。
-- 禁止无条件全盘枚举文件。调用 search_files 时必须提供 patterns 或 extensions，优先用指标标识、知识库文件名、常见日志扩展名缩小范围。
-- 如果需要更灵活的只读探索，优先调用 dynamic_scan_plan，用 pathHints、fileNameHints、contentQueries、includeExtensions 描述扫描计划。
-- 如果 dynamic_scan_plan 和现有工具仍不足，返回 tool_request，不要编造结果。
-- 不要要求读取完整大文件，优先 read_tail/read_sample/search_text/parse_xml。
-- search_files.patterns 使用普通文件名/路径片段/通配符，不是正则；例如写 "package.json" 或 "*.log"，不要写 "package\\.json"。
-- 如果某个工具调用已经返回 0 个结果，不要重复完全相同的 tool_call，应调整文件名、路径片段或直接给出 not_found。
-- 最终结果必须有文件路径和证据；没有证据时 status 应为 "not_found"。`;
+async function repairAction(rawText, indicator, context, hooks, trace, step) {
+  if (!rawText || context.aiOptions.outputMode === 'strict_json') return null;
+  await emit(hooks, trace, context, { type: 'parse_repair', indicator: indicator.indicator, indicatorId: indicator.indicatorId, step, message: '正在修复模型输出格式' });
+  try {
+    const result = await callAIStream(`把下面内容转换为 code_call 或 final JSON，只返回 JSON。\n${truncate(rawText, 6000)}`, {
+      ...context.aiOptions, outputMode: 'strict_json', formatJson: true, maxTokens: 4500, temperature: 0
+    });
+    return extractJSON(result.content);
+  } catch { return null; }
 }
 
-async function repairModelAction(rawText, indicator, context, hooks, trace, step) {
-  if ((context.aiOptions.outputMode || 'auto') !== 'auto') return null;
-  if (!rawText || !String(rawText).trim()) return null;
+function loadRelevantMemory(indicator, context) {
+  const memories = [];
+  try {
+    memories.push(...retrieveAgentMemories({ deviceType: context.deviceType, vendor: context.vendor, model: context.model, indicatorId: indicator.indicatorId, indicatorName: indicator.indicator, limit: context.maxCandidates }));
+  } catch {}
+  try {
+    const exact = getKnowledgeCandidates({ vendor: context.vendor, deviceType: context.deviceType, model: context.model, indicator: indicator.indicator, limit: context.maxCandidates });
+    const broader = exact.length < context.maxCandidates
+      ? getKnowledgeCandidates({ vendor: context.vendor, deviceType: context.deviceType, indicator: indicator.indicator, limit: context.maxCandidates })
+      : [];
+    const candidates = [...new Map([...exact, ...broader].map(item => [item.id, item])).values()];
+    memories.push(...candidates.sort((a, b) => memoryRank(a) - memoryRank(b)).map(item => ({
+      source: 'legacy_knowledge', status: item.validationStatus || item.status, indicatorName: item.indicatorName,
+      indicatorCode: item.indicatorCode, filePatterns: item.filePatterns, fileNamePatterns: item.fileNamePatterns,
+      keywords: item.keywords, selector: item.selector, operation: item.operation, meaning: item.meaning,
+      evidence: item.validatedEvidence || item.evidenceExample, confidence: item.validatedConfidence || item.confidence
+    })));
+  } catch {}
+  return memories.slice(0, context.maxCandidates);
+}
 
-  await emit(hooks, trace, {
-    type: 'parse_repair',
+function validateFinalResult(indicator, result, context, observations) {
+  const normalized = {
+    indicatorId: indicator.indicatorId,
     indicator: indicator.indicator,
-    step,
-    message: '模型这一步没有按工具格式返回，正在尝试纠正'
-  });
-
-  const repairPrompt = `请把下面模型回复转换成 Agent 决策 JSON。
-只能返回 JSON，不要 Markdown，不要解释。
-允许格式只有三种：
-1. {"type":"tool_call","thought":"","tool":"search_files","args":{}}
-2. {"type":"tool_request","tool":"","reason":"","input_schema":{},"expected_output":""}
-3. {"type":"final","result":{"indicator":"${indicator.indicator}","value":"","filePath":"","matchedKeyword":"","keywordMeaning":"","evidence":"","confidence":0,"status":"not_found","reason":""}}
-
-如果回复中没有明确工具调用或证据结论，返回 not_found。
-
-原始回复：
-${truncate(rawText, 3000)}`;
-
-  try {
-    let repaired = '';
-    const result = await callAIStream(
-      repairPrompt,
-      {
-        ...context.aiOptions,
-        formatJson: true,
-        outputMode: 'strict_json',
-        maxTokens: 800,
-        temperature: 0
-      },
-      token => {
-        repaired += token;
-      }
-    );
-    return extractJSON(result.content || repaired);
-  } catch {
-    return null;
-  }
-}
-
-function loadKnowledgeCandidates(indicator, context) {
-  if (context.maxCandidates <= 0) return [];
-  try {
-    return getKnowledgeCandidates({
-      vendor: context.vendor,
-      deviceType: context.deviceType,
-      model: context.model,
-      indicator: indicator.indicator,
-      status: 'draft',
-      limit: context.maxCandidates
-    }).map(candidate => ({
-      id: candidate.id,
-      indicatorName: candidate.indicatorName,
-      indicatorCode: candidate.indicatorCode,
-      ruleType: candidate.ruleType,
-      parserType: candidate.parserType,
-      filePatterns: candidate.filePatterns,
-      fileNamePatterns: candidate.fileNamePatterns,
-      keywords: candidate.keywords,
-      selector: candidate.selector,
-      operation: candidate.operation,
-      meaning: candidate.meaning,
-      evidenceExample: candidate.evidenceExample,
-      confidence: candidate.confidence
-    }));
-  } catch {
-    return [];
-  }
-}
-
-function normalizeFinalResult(indicator, result, observations) {
-  const status = String(result.status || '').trim() || (result.evidence ? 'success' : 'not_found');
-  return {
-    indicator: result.indicator || indicator.indicator,
+    indicatorCode: indicator.indicatorCode,
     value: String(result.value || ''),
     filePath: String(result.filePath || result.file_path || ''),
-    matchedKeyword: String(result.matchedKeyword || result.matched_keyword || result.keyword || ''),
+    matchedKeyword: String(result.matchedKeyword || result.matched_keyword || ''),
     keywordMeaning: String(result.keywordMeaning || result.keyword_meaning || ''),
-    evidence: String(result.evidence || result.line || ''),
-    confidence: clampNumber(result.confidence, 0, 100, status === 'success' ? 70 : 0),
-    status,
+    evidence: String(result.evidence || ''),
+    dataTimestamp: String(result.dataTimestamp || result.data_timestamp || ''),
+    fileMtime: String(result.fileMtime || result.file_mtime || ''),
+    evidenceLevel: String(result.evidenceLevel || result.evidence_level || 'NONE').toUpperCase(),
+    confidence: clampNumber(result.confidence, 0, 100, 0),
+    status: String(result.status || 'not_found'),
     reason: String(result.reason || ''),
     observations: observations.slice(-5)
   };
+  if (normalized.status !== 'success') return normalized;
+  if (!normalized.filePath || !normalized.evidence) return { ...normalized, status: 'needs_review', reason: '模型标记成功，但缺少文件路径或原始证据' };
+  if (!isInsideRoots(normalized.filePath, context.roots) || !fs.existsSync(normalized.filePath)) return { ...normalized, status: 'needs_review', reason: '模型返回的证据文件不存在或不在选定磁盘内' };
+  const stat = fs.statSync(normalized.filePath);
+  if (!stat.isFile()) return { ...normalized, status: 'needs_review', reason: '证据路径不是文件' };
+  normalized.fileMtime = normalized.fileMtime || stat.mtime.toISOString();
+  if (normalized.evidenceLevel === 'WEAK' || normalized.evidenceLevel === 'NONE') normalized.status = 'needs_review';
+  return normalized;
 }
 
-function createPendingResult(indicator, status, prompt) {
-  return {
-    indicator: indicator.indicator,
-    value: '',
-    filePath: '',
-    matchedKeyword: '',
-    keywordMeaning: '',
-    evidence: '',
-    confidence: 0,
-    status,
-    reason: 'dryRun only',
-    prompt
-  };
+function rememberResult(result, indicator, context) {
+  try {
+    saveAgentMemory({
+      memoryType: result.status === 'success' ? 'task_success' : 'dead_end', deviceType: context.deviceType,
+      vendor: context.vendor, model: context.model, indicatorId: indicator.indicatorId, indicatorName: indicator.indicator,
+      title: `${indicator.indicator}：${result.status}`, content: JSON.stringify({ value: result.value, filePath: stripDrive(result.filePath), matchedKeyword: result.matchedKeyword, meaning: result.keywordMeaning, reason: result.reason }),
+      sourceTaskId: context.taskId, evidence: result.evidence ? [{ filePath: stripDrive(result.filePath), content: result.evidence, fileMtime: result.fileMtime }] : [],
+      confidence: result.confidence,
+      status: result.status === 'success' || (result.status === 'not_found' && result.observations?.length) ? 'verified' : 'draft'
+    });
+  } catch {}
 }
 
-function compactToolResult(toolName, result, maxChars) {
-  const compact = { ...result };
-  if (Array.isArray(compact.files)) compact.files = compact.files.slice(0, 20);
-  if (Array.isArray(compact.matches)) compact.matches = compact.matches.slice(0, 20);
-  if (Array.isArray(compact.lines)) compact.lines = compact.lines.slice(0, 80);
-  if (Array.isArray(compact.first)) compact.first = compact.first.slice(0, 5);
-  if (Array.isArray(compact.last)) compact.last = compact.last.slice(0, 5);
-  if (typeof compact.text === 'string') compact.text = truncate(compact.text, 4000);
-  const json = JSON.stringify(compact);
-  return JSON.parse(truncateJson(json, maxChars));
+function compactResult(value, maxChars) {
+  const json = JSON.stringify(value);
+  if (json.length <= maxChars) return value;
+  return { success: value.success !== false, truncated: true, preview: json.slice(0, maxChars), durationMs: value.durationMs || 0 };
 }
 
-function summarizeToolResult(toolName, result) {
-  if (result.success === false) return result.error || '工具调用失败';
-  if (toolName === 'search_files') return `找到 ${result.count || 0} 个文件，检查 ${result.checked?.files || 0} 个文件`;
-  if (toolName === 'dynamic_scan_plan') return `扫描计划找到 ${result.count || 0} 个候选文件，检查 ${result.checked?.files || 0} 个文件`;
-  if (toolName === 'search_text') return `命中 ${result.count || 0} 行`;
-  if (toolName === 'parse_xml') return `提取 ${result.count || 0} 个 XML 值`;
-  if (toolName === 'count_rows') return `行数 ${result.rows || 0}`;
-  return '工具返回成功';
-}
-
-function redactToolArgs(args = {}) {
-  const clone = { ...args };
-  delete clone.apiKey;
-  return clone;
+function summarizeCodeResult(result) {
+  if (result.success === false) return result.error || '执行失败';
+  const payload = result.result;
+  if (Array.isArray(payload)) return `返回 ${payload.length} 条记录`;
+  if (Array.isArray(payload?.files)) return `发现 ${payload.files.length} 个候选文件`;
+  if (Array.isArray(payload?.matches)) return `发现 ${payload.matches.length} 条匹配证据`;
+  return `执行成功，耗时 ${result.durationMs || 0} ms`;
 }
 
 function normalizeIndicators(value) {
   if (!Array.isArray(value)) return [];
-  return value.map(item => {
-    if (typeof item === 'string') return { indicator: item.trim() };
-    return {
-      indicator: String(item.indicator || item.name || item.indicatorName || '').trim(),
-      indicatorCode: String(item.indicatorCode || item.indicator_code || item.code || '').trim(),
-      keyword: item.keyword || '',
-      synonyms: item.synonyms || [],
-      filePattern: item.filePattern || item.file_pattern || '',
-      keywordMeaning: item.keywordMeaning || item.keyword_meaning || ''
-    };
-  }).filter(item => item.indicator);
+  return value.map((item, index) => typeof item === 'string'
+    ? { indicatorId: `CUSTOM_${index + 1}`, indicator: item.trim(), indicatorCode: '' }
+    : {
+        indicatorId: String(item.indicatorId || item.id || `CUSTOM_${index + 1}`).trim(),
+        indicator: String(item.indicator || item.name || item.indicatorName || '').trim(),
+        indicatorCode: String(item.indicatorCode || item.indicator_code || item.code || '').trim()
+      }).filter(item => item.indicator);
 }
 
 function normalizeRoots(value) {
-  return normalizeList(value).map(root => {
-    const text = String(root || '').trim();
-    return /^[a-z]:$/i.test(text) ? `${text}\\` : text;
-  });
+  const list = Array.isArray(value) ? value : String(value || '').split(/[;,\n]/);
+  return list.map(item => path.resolve(String(item || '').trim())).filter(Boolean);
 }
 
-function normalizeList(value) {
-  if (Array.isArray(value)) return value.map(item => String(item || '').trim()).filter(Boolean);
-  return String(value || '').split(/\r?\n|;|；|,/).map(item => item.trim()).filter(Boolean);
+function emptyResult(indicator, status, reason) {
+  return { indicatorId: indicator.indicatorId, indicator: indicator.indicator, indicatorCode: indicator.indicatorCode, value: '', filePath: '', matchedKeyword: '', keywordMeaning: '', evidence: '', dataTimestamp: '', fileMtime: '', evidenceLevel: 'NONE', confidence: 0, status, reason };
 }
 
-function normalizeSearchPattern(value) {
-  return String(value || '')
-    .trim()
-    .replace(/\\([.()[\]{}+^$|])/g, '$1')
-    .replace(/^\^/, '')
-    .replace(/\$$/, '');
-}
-
-function isPathInsideRoots(filePath, roots) {
-  const resolvedFile = path.resolve(filePath).toLowerCase();
+function isInsideRoots(filePath, roots) {
+  const resolved = path.resolve(filePath).toLowerCase();
   return roots.some(root => {
-    const resolvedRoot = path.resolve(root).toLowerCase();
-    return resolvedFile === resolvedRoot || resolvedFile.startsWith(resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`);
+    const base = path.resolve(root).toLowerCase();
+    return resolved === base || resolved.startsWith(`${base}${path.sep}`);
   });
 }
 
-async function emit(hooks, trace, event) {
-  trace.push({ ...event, time: new Date().toISOString() });
-  hooks.onEvent?.(event);
-  await new Promise(resolve => setImmediate(resolve));
+function stripDrive(value) {
+  return String(value || '').replace(/^[a-z]:[\\/]/i, '').replace(/\\/g, '/');
 }
 
-function clampNumber(value, min, max, fallback) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return fallback;
-  return Math.min(max, Math.max(min, Math.round(number)));
+function memoryRank(item) {
+  if (item.validationStatus === 'verified') return 0;
+  if (item.status === 'verified') return 1;
+  return 2;
 }
 
-function truncate(value, maxLength) {
-  const text = String(value || '');
-  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+async function emit(hooks, trace, context, event) {
+  const payload = { ...event, timestamp: new Date().toISOString() };
+  trace.push(payload);
+  try { appendAgentEvent(context.taskId, payload); } catch {}
+  await hooks.onEvent?.(payload);
 }
 
-function truncateJson(json, maxChars) {
-  if (json.length <= maxChars) return json;
-  return JSON.stringify({
-    success: false,
-    truncated: true,
-    message: '工具结果过长，已截断摘要',
-    preview: json.slice(0, maxChars)
-  });
-}
+function safeCreateTask(input) { try { return createAgentTask(input); } catch { return `task_${Date.now()}`; } }
+function safeUpdateTask(id, value) { try { updateAgentTask(id, value); } catch {} }
+function safeSaveTool(value) { try { return saveGeneratedTool(value); } catch { return null; } }
+function safeRecordToolRun(id, value) { try { recordGeneratedToolRun(id, value); } catch {} }
+function clampNumber(value, min, max, fallback) { const number = Number(value); return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback; }
+function truncate(value, max) { const text = String(value || ''); return text.length > max ? `${text.slice(0, max)}...` : text; }

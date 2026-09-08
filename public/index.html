@@ -18,7 +18,7 @@
         </div>
         <div>
           <h1>大放设备参数采集程序</h1>
-          <span class="version">v3.0</span>
+          <span class="version">v4.0</span>
         </div>
       </div>
       <div class="header-right">
@@ -38,7 +38,7 @@
         <div class="step-line"></div>
         <div class="step" data-step="2">
           <div class="step-number">2</div>
-          <span>选择模板</span>
+          <span>选择类型</span>
         </div>
         <div class="step-line"></div>
         <div class="step" data-step="3">
@@ -100,7 +100,7 @@
               <line x1="16" y1="13" x2="8" y2="13"/>
               <line x1="16" y1="17" x2="8" y2="17"/>
             </svg>
-            选择采集模板
+            选择设备类型和采集指标
           </h2>
           <button class="btn btn-sm btn-outline" id="btnDownloadExample">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -108,7 +108,7 @@
               <polyline points="7 10 12 15 17 10"/>
               <line x1="12" y1="15" x2="12" y2="3"/>
             </svg>
-            下载模板示例
+            下载当前指标表
           </button>
         </div>
 
@@ -120,11 +120,16 @@
               <line x1="8" y1="21" x2="16" y2="21"/>
               <line x1="12" y1="17" x2="12" y2="21"/>
             </svg>
-            厂商 + 设备类型:
+            厂商、设备类型和型号:
           </label>
           <div class="selector-row">
             <input class="device-select" id="vendorInput" placeholder="输入厂商名称" style="flex:1;">
-            <input class="device-select" id="deviceTypeInput" placeholder="输入设备类型" style="flex:1;">
+            <select class="device-select" id="deviceTypeInput" style="flex:1;">
+              <option value="">选择设备类型</option>
+              <option value="CT">CT</option>
+              <option value="MR">MR</option>
+              <option value="DR">DR</option>
+            </select>
             <input class="device-select" id="deviceModelInput" placeholder="型号（可选）" style="flex:1;">
           </div>
         </div>
@@ -137,7 +142,7 @@
         </div>
 
         <!-- 上传区域 -->
-        <div class="upload-zone" id="uploadZone">
+        <div class="upload-zone" id="uploadZone" style="display:none;">
           <div class="upload-icon">
             <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -153,7 +158,7 @@
         <!-- 模板预览表格 -->
         <div class="template-preview" id="templatePreview" style="display:none;">
           <div class="preview-header">
-            <h3>模板规则预览 <small style="color:#888;font-weight:normal;font-size:12px;">（可直接编辑）</small></h3>
+            <h3>采集指标预览 <small style="color:#888;font-weight:normal;font-size:12px;">（由设备类型自动生成，可直接编辑）</small></h3>
             <div class="preview-actions">
               <button class="btn btn-sm btn-secondary" id="btnAddRule" title="添加一行">+ 添加行</button>
               <span class="rule-count" id="ruleCount">0 条规则</span>
@@ -191,14 +196,9 @@
         </div>
 
         <div class="agent-api-config" id="agentApiConfig">
+          <input id="agentProvider" type="hidden" value="api">
+          <input id="agentOutputMode" type="hidden" value="auto">
           <div class="agent-api-grid">
-            <label class="agent-api-field">
-              <span>模型类型</span>
-              <select id="agentProvider" class="agent-api-input">
-                <option value="ollama">本地模型</option>
-                <option value="custom">API 接口</option>
-              </select>
-            </label>
             <label class="agent-api-field">
               <span>Base URL</span>
               <input id="agentBaseUrl" class="agent-api-input" type="text" placeholder="https://api.deepseek.com">
@@ -210,13 +210,6 @@
             <label class="agent-api-field">
               <span>API Key</span>
               <input id="agentApiKey" class="agent-api-input" type="password" placeholder="仅当前会话使用">
-            </label>
-            <label class="agent-api-field">
-              <span>输出模式</span>
-              <select id="agentOutputMode" class="agent-api-input">
-                <option value="auto">自动纠偏</option>
-                <option value="strict_json">严格 JSON</option>
-              </select>
             </label>
           </div>
           <div class="agent-api-actions">
@@ -244,11 +237,11 @@
           </div>
           <div class="info-row">
             <span class="info-label">采集规则:</span>
-            <span class="info-value" id="infoRules">未上传模板</span>
+            <span class="info-value" id="infoRules">未选择设备类型</span>
           </div>
           <div class="info-row">
             <span class="info-label">采集方式:</span>
-            <span class="info-value">AI Agent 调用本地工具采集证据</span>
+            <span class="info-value">外部 API 生成只读工具，本地执行并验证证据</span>
           </div>
         </div>
 
@@ -361,6 +354,9 @@
                 <th>匹配关键字</th>
                 <th>关键字和含义</th>
                 <th>证据内容</th>
+                <th>数据时间</th>
+                <th>文件修改时间</th>
+                <th>证据等级</th>
                 <th>置信度</th>
                 <th>状态</th>
               </tr>
@@ -466,7 +462,12 @@
             </div>
             <div class="form-group">
               <label>设备类型 <span class="required">*</span></label>
-              <input type="text" id="rawExpDeviceType" placeholder="例如：CT、MRI">
+              <select id="rawExpDeviceType">
+                <option value="">请选择</option>
+                <option value="CT">CT</option>
+                <option value="MR">MR</option>
+                <option value="DR">DR</option>
+              </select>
             </div>
             <div class="form-group">
               <label>设备型号</label>
@@ -521,7 +522,7 @@
 
     <!-- 底部状态栏 -->
     <footer class="app-footer">
-      <span>大放设备参数采集程序 v3.0</span>
+      <span>大放设备参数采集程序 v4.0</span>
       <span id="footerStatus">就绪</span>
     </footer>
   </div>

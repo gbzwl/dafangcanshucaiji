@@ -1,5 +1,5 @@
 /**
- * MRI设备日志参数采集工具 v2.0 - 前端逻辑
+ * CT/MR/DR device collection Agent frontend.
  */
 
 // ============ 状态管理 ============
@@ -21,9 +21,9 @@ const state = {
   agentLastErrorMessage: '',
   rawExperienceImportFile: null,
   agentConfig: {
-    provider: 'ollama',
-    baseUrl: 'http://localhost:11434',
-    model: '',
+    provider: 'api',
+    baseUrl: 'https://api.deepseek.com',
+    model: 'deepseek-chat',
     apiKey: '',
     outputMode: 'auto'
   }
@@ -31,13 +31,13 @@ const state = {
 
 const DEFAULT_AGENT_PROFILE = `你是医疗设备数据采集场景中的决策大脑/分析师，不直接碰文件系统。
 
-你的工作是：理解待采指标，结合知识库和当前设备上下文推测可能位置，决定下一步调用什么程序工具，判断工具返回结果是否可信，最终输出结构化结论。
+你的工作是：理解待采指标，结合知识库和当前设备上下文推测可能位置，生成完成本次探索所需的只读代码，判断执行结果是否可信，最终输出结构化结论。
 
 分工边界：
 - 你是决策者/分析师：负责理解、推测、决策、判定。
-- 程序是执行器/验证器：负责搜文件、读片段、解析、统计、返回结构化结果。
+- 程序是执行器/验证器：负责执行你生成的只读代码、记录过程并验证结构化结果。
 - 你不能臆造值，不能假装已经读取文件。
-- 所有结论必须基于程序工具返回的真实证据。
+- 所有结论必须基于本地程序执行代码后返回的真实证据。
 
 知识使用原则：
 - 你不预设任何固定设备路径或固定指标规则。
@@ -56,8 +56,7 @@ const DEFAULT_AGENT_PROFILE = `你是医疗设备数据采集场景中的决策�
 
 输出约束：
 - 决策步骤必须输出结构化 JSON。
-- 如果需要工具，输出 tool_call。
-- 如果现有工具不足，输出 tool_request。
+- 如果需要探索，输出 code_call 并生成本次所需的只读 JavaScript。
 - 如果证据不足，输出 not_found 或 needs_review。
 - 最终结果必须包含 value、evidence、confidence、evidence_level、reason。`;
 
@@ -85,7 +84,7 @@ async function initApp() {
   await loadDisks();
 
   // 加载设备模板列表
-  await loadDevices();
+  await loadIndicatorCatalogs();
 
   // 绑定事件
   bindEvents();
@@ -289,6 +288,46 @@ async function buildIndex() {
 }
 
 // ============ 设备模板管理 ============
+async function loadIndicatorCatalogs() {
+  try {
+    const response = await fetch('/api/v1/indicator-catalogs');
+    const data = await response.json();
+    if (!data.success) throw new Error(data.error || '固定指标目录加载失败');
+    state.indicatorCatalogs = data.catalogs || [];
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function loadIndicatorCatalog(deviceType) {
+  const type = String(deviceType || '').trim().toUpperCase();
+  if (!type) {
+    state.templateRules = [];
+    state.templateFilename = '';
+    renderTemplatePreview();
+    updateCollectButton();
+    return;
+  }
+  try {
+    const response = await fetch(`/api/v1/indicator-catalogs/${encodeURIComponent(type)}`);
+    const data = await response.json();
+    if (!data.success) throw new Error(data.error || '固定指标目录加载失败');
+    state.templateRules = (data.indicators || []).map(item => ({
+      indicatorId: item.id,
+      indicator: item.indicator,
+      indicatorCode: item.indicatorCode || '',
+      enabled: item.enabled !== false
+    }));
+    state.templateFilename = `${type} 固定指标`;
+    renderTemplatePreview();
+    updateCollectButton();
+    updateStep(2);
+    showToast(`已生成 ${data.count || 0} 个 ${type} 采集指标，可直接编辑`, 'success');
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
 async function loadDevices() {
   try {
     const res = await fetch('/api/v1/devices');
@@ -453,7 +492,7 @@ function addRuleRow() {
     return;
   }
   if (!state.templateRules) state.templateRules = [];
-  state.templateRules.push({ indicator: '', indicatorCode: '', filePattern: '', keyword: '', synonyms: [], keywordMeaning: '' });
+  state.templateRules.push({ indicatorId: `CUSTOM_${Date.now()}`, indicator: '', indicatorCode: '' });
   renderTemplatePreview();
   // 聚焦到新增行的指标名称输入框
   const inputs = document.querySelectorAll('#templateTable tbody .rule-input[data-field="indicator"]');
@@ -710,6 +749,7 @@ async function startCollection() {
         model: $('#deviceModelInput')?.value || '',
         instruction,
         indicators: state.templateRules.map(rule => ({
+          indicatorId: rule.indicatorId || rule.id || '',
           indicator: rule.indicator,
           indicatorCode: rule.indicatorCode || rule.indicator_code || '',
           keyword: '',
@@ -721,9 +761,7 @@ async function startCollection() {
         backend: agentOptions.backend,
         baseUrl: agentOptions.baseUrl,
         apiKey: agentOptions.apiKey,
-        aiModel: agentOptions.provider === 'ollama'
-          ? ($('#aiModelSelect')?.value || agentOptions.model || '')
-          : agentOptions.model,
+        aiModel: agentOptions.model,
         maxSteps: readNumberInput('#agentMaxSteps', 10),
         maxDurationMs: readNumberInput('#agentMaxDuration', 300) * 1000,
         maxCandidates: readNumberInput('#agentMaxCandidates', 8),
@@ -786,10 +824,11 @@ function handleAgentEvent(data) {
   if (data.type === 'error') {
     state.agentLastErrorMessage = data.message || '';
   }
-  if (data.type === 'model_delta') {
+  if (data.type === 'model_reasoning_delta') {
     appendAgentDelta(data.content || '');
     return;
   }
+  if (data.type === 'model_delta') return;
   if (data.type === 'model_step') {
     state.agentStreamingMessage = null;
   }
@@ -798,7 +837,7 @@ function handleAgentEvent(data) {
   if (!text) return;
 
   const type = data.type === 'error' || data.type === 'parse_error' ? 'error'
-    : data.type === 'tool_call' || data.type === 'tool_result' || data.type === 'tool_request' ? 'tool'
+    : data.type === 'code_call' || data.type === 'code_result' ? 'tool'
     : data.type === 'complete' || data.type === 'indicator_complete' ? 'agent'
     : 'muted';
   addAgentMessage(type, text);
@@ -811,19 +850,17 @@ function formatAgentEvent(data) {
   if (data.type === 'parse_error') {
     return `模型没有返回有效 JSON：${data.indicator || '当前指标'} 第 ${data.step || '-'} 步`;
   }
-  if (data.type === 'tool_request') {
-    const tool = data.tool || '未命名工具';
-    const reason = data.reason || data.expectedOutput || '当前工具箱不能可靠完成这一步';
-    return `工具需求：${tool}\n原因：${reason}`;
-  }
   const indicator = data.indicator ? `「${data.indicator}」` : '';
   if (data.type === 'request') return `收到采集任务：${data.indicatorCount || 0} 个指标，${(data.roots || []).join(', ')}`;
   if (data.type === 'start') return data.message || 'Agent 开始采集';
+  if (data.type === 'planning') return data.message || '正在制定整批指标的共享探索计划';
+  if (data.type === 'plan_ready') return `共享探索计划已生成：${(data.groups || []).length} 个指标分组${data.strategy ? `\n${data.strategy}` : ''}`;
+  if (data.type === 'planning_fallback') return data.message || '共享计划不可用，按当前指标顺序继续';
   if (data.type === 'indicator_start') return `开始分析指标 ${indicator}（${data.index}/${data.total}）`;
   if (data.type === 'knowledge') return `知识库候选：${indicator} 找到 ${data.count || 0} 条`;
   if (data.type === 'model_step') return `模型决策：${indicator} 第 ${data.step}/${data.maxSteps} 步`;
-  if (data.type === 'tool_call') return `调用工具 ${data.tool}：${data.thought || '准备获取证据'}`;
-  if (data.type === 'tool_result') return `工具结果 ${data.tool}：${data.summary || (data.success ? '成功' : '失败')}`;
+  if (data.type === 'code_call') return `生成并执行 ${data.tool}：${data.thought || '探索当前磁盘并获取证据'}`;
+  if (data.type === 'code_result') return `执行结果 ${data.tool}：${data.summary || (data.success ? '成功' : '失败')}`;
   if (data.type === 'indicator_complete') return `指标完成 ${indicator}：${data.status}，置信度 ${data.confidence || 0}%`;
   if (data.type === 'complete') return data.message || 'Agent 采集完成';
   if (data.type === 'error') return `错误：${data.message || 'Agent 执行失败'}`;
@@ -1024,6 +1061,9 @@ function renderResults(results = [], scanLog = {}) {
         <td class="keyword-cell">${r.matchedKeyword ? `<code>${escapeHtml(r.matchedKeyword)}</code>` : '<span class="text-muted">-</span>'}</td>
         <td class="keyword-meaning-cell">${keywordMeaning ? escapeHtml(keywordMeaning) : '<span class="text-muted">-</span>'}</td>
         <td class="match-line-cell">${evidence ? escapeHtml(evidence) : '<span class="text-muted">-</span>'}</td>
+        <td>${escapeHtml(r.dataTimestamp || r.data_timestamp || '-')}</td>
+        <td>${escapeHtml(r.fileMtime || r.file_mtime || '-')}</td>
+        <td><span class="agent-status-badge">${escapeHtml(r.evidenceLevel || r.evidence_level || 'NONE')}</span></td>
         <td><span class="confidence ${confidenceClass}">${confidence}%</span></td>
         <td><span class="agent-status-badge agent-status-${escapeHtml(status)}">${escapeHtml(statusText)}</span></td>
       </tr>
@@ -1606,7 +1646,7 @@ async function importSelectedRawExperience() {
 
 async function generateKnowledgeCandidatesFromImport({ vendor, deviceType, model, limit }) {
   const aiOptions = getAgentAIOptions();
-  if (aiOptions.provider !== 'ollama' && !aiOptions.apiKey) {
+  if (!aiOptions.apiKey) {
     return { success: false, error: '未输入 API Key' };
   }
 
@@ -1672,7 +1712,7 @@ function normalizeKnowledgeFailureReason(reason) {
   const text = String(reason || '').trim();
   if (!text) return '未知错误';
   if (/api key|unauthorized|401|403|未输入|未提供/i.test(text)) return 'API Key 未配置或无效';
-  if (/not found|model.*not|模型.*不存在|未安装模型|404/i.test(text)) return '模型名称不正确或本地模型未安装';
+  if (/not found|model.*not|模型.*不存在|404/i.test(text)) return '模型名称不正确或 API 不支持该模型';
   if (/timeout|timed out|超时/i.test(text)) return '模型响应超时';
   if (/json|有效 JSON|格式/i.test(text)) return '模型没有按 JSON 格式返回';
   if (/fetch|connect|ECONNREFUSED|ENOTFOUND|network|连接/i.test(text)) return '模型服务连接失败';
@@ -1739,7 +1779,7 @@ async function aiAutoFill() {
   }
   
   if (!state.templateRules.length) {
-    showToast('请先上传模板', 'error');
+    showToast('请先选择设备类型并生成采集指标', 'error');
     return;
   }
 
@@ -1871,10 +1911,8 @@ async function aiAutoFill() {
     } else {
       // 无经验记录，使用 AI 生成
       const agentOptions = getAgentAIOptions();
-      const selectedModel = agentOptions.provider === 'ollama'
-        ? ($('#aiModelSelect')?.value || agentOptions.model || '')
-        : (agentOptions.model || $('#aiModelSelect')?.value || '');
-      const selectedBackend = document.querySelector('input[name="aiEngine"]:checked')?.value || 'ollama';
+      const selectedModel = agentOptions.model || '';
+      const selectedBackend = 'api';
       const res = await fetch('/api/v1/ai/autofill', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1949,6 +1987,10 @@ async function aiAutoFill() {
 
 // ============ 事件绑定 ============
 function bindEvents() {
+  const deviceTypeInput = $('#deviceTypeInput');
+  if (deviceTypeInput) {
+    deviceTypeInput.addEventListener('change', event => loadIndicatorCatalog(event.target.value));
+  }
   // 刷新磁盘
   $('#btnRefreshDisks').addEventListener('click', loadDisks);
 
@@ -1957,7 +1999,12 @@ function bindEvents() {
 
   // 下载模板示例
   $('#btnDownloadExample').addEventListener('click', () => {
-    window.open('/api/v1/template/example', '_blank');
+    const deviceType = $('#deviceTypeInput')?.value || '';
+    if (!deviceType) {
+      showToast('请先选择 CT、MR 或 DR', 'warning');
+      return;
+    }
+    window.open(`/api/v1/indicator-catalogs/${encodeURIComponent(deviceType)}/download`, '_blank');
   });
 
   // 添加规则行
@@ -2089,30 +2136,6 @@ function bindEvents() {
     window.open('/api/v1/result/download', '_blank');
   });
 
-  // AI 引擎切换
-  document.querySelectorAll('input[name="aiEngine"]').forEach(radio => {
-    radio.addEventListener('change', (e) => {
-      const provider = $('#agentProvider');
-      if (provider) {
-        provider.value = e.target.value === 'ollama' ? 'ollama' : 'deepseek';
-        applyAgentProviderDefaults(provider.value);
-      }
-      const modelSelect = $('#aiModelSelect');
-      if (e.target.value === 'deepseek') {
-        if (modelSelect) {
-          modelSelect.innerHTML = '<option value="deepseek-chat">deepseek-chat</option>';
-          modelSelect.disabled = true;
-        }
-      } else {
-        if (modelSelect) {
-          modelSelect.disabled = false;
-          modelSelect.innerHTML = '<option value="">加载中...</option>';
-        }
-      }
-      checkAiStatus();
-    });
-  });
-
   // 初始化 AI 状态
   bindAgentApiConfig();
   checkAiStatus();
@@ -2219,19 +2242,18 @@ function renderAgentConfig(config = {}) {
   const baseUrl = $('#agentBaseUrl');
   const model = $('#agentModelName');
   const outputMode = $('#agentOutputMode');
-  const providerValue = config.provider || provider?.value || 'ollama';
+  const providerValue = 'api';
   if (provider && config.provider) provider.value = config.provider;
   if (baseUrl) baseUrl.value = config.baseUrl || defaultAgentBaseUrl(providerValue);
   if (model) {
-    const modelValue = providerValue === 'ollama' && isCloudDefaultModel(config.model) ? '' : (config.model || defaultAgentModel(providerValue));
-    model.value = modelValue;
+    model.value = config.model || defaultAgentModel();
   }
   if (outputMode) outputMode.value = config.outputMode || 'auto';
   setAgentStatus(config.hasApiKey ? '已配置 Key' : '未配置 Key', config.hasApiKey ? 'success' : 'info');
 }
 
 function readAgentConfigForm() {
-  const provider = $('#agentProvider')?.value || 'ollama';
+  const provider = 'api';
   return {
     provider,
     backend: provider,
@@ -2251,12 +2273,7 @@ function applyAgentProviderDefaults(provider) {
   setAgentStatus('未测试', 'info');
 }
 
-function syncAiEngineFromAgentProvider() {
-  const provider = $('#agentProvider')?.value || 'ollama';
-  const engine = provider === 'ollama' ? 'ollama' : 'deepseek';
-  const radio = document.querySelector(`input[name="aiEngine"][value="${engine}"]`);
-  if (radio) radio.checked = true;
-}
+function syncAiEngineFromAgentProvider() {}
 
 function getAgentAIOptions() {
   state.agentConfig = readAgentConfigForm();
@@ -2268,7 +2285,7 @@ async function testAgentConnection() {
   const config = readAgentConfigForm();
   state.agentConfig = config;
 
-  if (config.provider !== 'ollama' && !config.apiKey) {
+  if (!config.apiKey) {
     setAgentStatus('请先输入 API Key', 'error');
     showToast('请先输入 API Key', 'warning');
     return;
@@ -2308,18 +2325,11 @@ function setAgentStatus(text, type = 'info') {
 }
 
 function defaultAgentBaseUrl(provider) {
-  const map = {
-    ollama: 'http://localhost:11434',
-    custom: 'https://api.deepseek.com'
-  };
-  return map[provider] || '';
+  return 'https://api.deepseek.com';
 }
 
 function defaultAgentModel(provider) {
-  const map = {
-    custom: 'deepseek-chat'
-  };
-  return map[provider] || '';
+  return 'deepseek-chat';
 }
 
 function isCloudDefaultModel(model) {
@@ -2329,88 +2339,35 @@ function isCloudDefaultModel(model) {
 async function checkAiStatus() {
   const dot = $('#aiStatusDot');
   const text = $('#aiStatusText');
-  let selectedBackend = document.querySelector('input[name="aiEngine"]:checked')?.value || 'ollama';
-
   try {
     const res = await fetch('/api/v1/ai/status');
     const data = await res.json();
     if (data.agentConfig) {
       renderAgentConfig(data.agentConfig);
-      syncAiEngineFromAgentProvider();
-      selectedBackend = document.querySelector('input[name="aiEngine"]:checked')?.value || selectedBackend;
     }
-
-    if (selectedBackend === 'ollama') {
-      await loadOllamaModels();
-    } else {
-      const select = $('#aiModelSelect');
-      if (select) {
-        select.innerHTML = '<option value="deepseek-chat">deepseek-chat</option>';
-        select.disabled = true;
-      }
-    }
-
     if (dot && text) {
-      if (selectedBackend === 'ollama' && data.ollama && data.ollama.available) {
+      if (data.agentConfig?.hasApiKey) {
         dot.className = 'status-dot connected';
-        text.textContent = 'Ollama 已连接';
-      } else if (selectedBackend !== 'ollama' && data.agentConfig && data.agentConfig.hasApiKey) {
-        dot.className = 'status-dot connected';
-        text.textContent = `${data.agentConfig.provider || 'API'} 已配置`;
-      } else if (selectedBackend === 'deepseek' && data.deepseek && data.deepseek.available) {
-        dot.className = 'status-dot connected';
-        text.textContent = 'DeepSeek 已连接';
+        text.textContent = '外部 API 已配置';
       } else {
         dot.className = 'status-dot error';
-        text.textContent = selectedBackend === 'ollama' ? 'Ollama 不可用' : 'DeepSeek 未配置';
+        text.textContent = '外部 API 未配置';
       }
     }
   } catch {
-    const select = $('#aiModelSelect');
-    if (select) {
-      select.innerHTML = '<option value="">无法获取模型状态</option>';
-    }
     if (dot && text) {
       dot.className = 'status-dot error';
-      text.textContent = '无法连接 AI 服务';
+      text.textContent = '无法读取 API 配置';
     }
-  }
-}
-
-async function loadOllamaModels() {
-  const select = $('#aiModelSelect');
-  if (!select) return;
-
-  try {
-    const res = await fetch('/api/v1/ai/models');
-    const data = await res.json();
-
-    if (data.success && data.models.length > 0) {
-      // 清空现有选项
-      select.innerHTML = '';
-      // 添加本地模型
-      data.models.forEach((model, index) => {
-        const option = document.createElement('option');
-        option.value = model.name;
-        option.textContent = `${model.name} (${model.size})`;
-        if (index === 0) option.selected = true;
-        select.appendChild(option);
-      });
-    } else {
-      // Ollama 无模型，显示提示
-      select.innerHTML = '<option value="">Ollama 中暂无模型，请先安装</option>';
-    }
-  } catch {
-    select.innerHTML = '<option value="">无法获取模型列表</option>';
   }
 }
 
 function getSelectedEngine() {
-  return document.querySelector('input[name="aiEngine"]:checked').value;
+  return 'api';
 }
 
 function getSelectedModel() {
-  return $('#aiModelSelect').value;
+  return readAgentConfigForm().model;
 }
 
 function showAiInput(title, contentHtml) {
