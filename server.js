@@ -608,22 +608,27 @@ async function executeAgentCollection(body = {}, signal = null, sessionContext =
 }
 
 function detectAgentIntent(message = '') {
-  const text = String(message || '').trim().toLowerCase();
+  const text = String(message || '').trim();
   if (!text) return 'empty';
 
-  if ((text.includes('模型') || text.includes('model')) && /(你|当前|现在|什么|哪个|名称|配置|使用|用的是|provider|what|which|using|use|are you)/.test(text)) {
+  // 配置相关检测 - 更精确，仅当明确询问模型配置时才返回
+  if (/(模型|AI|大模型|人工智能)/i.test(text) && /(配置|设置|参数|怎么用|怎么配置|告诉我)/i.test(text)) {
     return 'config';
   }
   if (text.includes('api key') || text.includes('base url') || text.includes('服务商')) {
     return 'config';
   }
-  if (/(开始|执行|进行|帮我|根据|用当前|按当前).*(采集|扫描|搜寻|搜索|查找|提取)|^(采集|扫描|开始采集|开始扫描)$/.test(text)) {
-    return 'collect';
+  // 仅当明确以“开始扫描”、“开始采集”开头，或句子完全为采集相关时才触发
+  const collectPatterns = ['^开始扫描', '^开始采集', '^扫描', '^采集'];
+  const isExplicitCollect = collectPatterns.some(p => text.startsWith(p));
+  // 如果句子只是简单的“扫描什么”之类，不触发自动收集，保留 chat 模式
+  if (isExplicitCollect) return 'collect';
+  // 仅当同时包含“帮我扫描/采集”且后面有具体指标描述时才触发
+  if (/[帮我请我].*(扫描|采集).{1,50}/i.test(text)) {
+    // 检查是否有具体的指标或设备描述，有的话才收集，无的话聊天
+    if (/[的了及在吗].{1,30}/i.test(text)) return 'collect';
   }
-  if (/(你是|你用|当前|现在).*(什么|哪个)?.*(模型|大模型)|模型.*(是什么|名称|配置)|api.*(配置|key|服务商)|provider|base url/.test(text)) {
-    return 'config';
-  }
-  if (/(停止|中止|取消|暂停).*(采集|扫描|任务)?/.test(text)) {
+  if (/(停止|中止|取消|暂停).*(采集|扫描|任务)?/i.test(text)) {
     return 'stop';
   }
   return 'chat';
@@ -715,18 +720,46 @@ ${body.agentProfile || '未设置'}`;
     type: 'chat_processing',
     message: `已载入本次会话的 ${history.length} 条消息，正在交给模型分析`
   });
-  const aiResult = await callAIStream(message, {
-    ...aiOptions,
-    messages,
-    formatJson: false,
-    temperature: 0.3,
-    maxTokens: body.maxTokens || 2000
-  }, (token, meta = {}) => {
-    pushAgentEvent({
-      type: meta.type === 'reasoning' ? 'model_reasoning_delta' : 'model_delta',
-      content: token
+let aiResult;
+  try {
+    aiResult = await callAIStream(message, {
+      ...aiOptions,
+      messages,
+      formatJson: false,
+      temperature: 0.3,
+      maxTokens: body.maxTokens || 2000
+    }, (token, meta = {}) => {
+      pushAgentEvent({
+        type: meta.type === 'reasoning' ? 'model_reasoning_delta' : 'model_delta',
+        content: token
+      });
     });
-  });
+  } catch (e) {
+    // 捕获 AI 模型输入错误（如图片输入不支持）并返回友好错误信息
+    const errorMsg = e.message || '未知错误';
+    if (/image|png|photo|picture/i.test(errorMsg)) {
+      const friendlyError = '模型当前不支持图片输入，请使用文字描述进行提问。';
+      await pushAgentEventNow({
+        type: 'error',
+        message: friendlyError
+      });
+      return res.json({ success: true, mode: 'chat', intent: 'chat', answer: friendlyError, sessionId: body.sessionId || RUNTIME_SESSION_ID });
+    }
+    console.error('AI 调用错误:', errorMsg);
+    await pushAgentEventNow({
+      type: 'error',
+      message: '模型处理失败: ' + errorMsg
+    });
+    return res.json({ success: true, mode: 'chat', intent: 'chat', answer: '模型处理失败，请稍后重试。', sessionId: body.sessionId || RUNTIME_SESSION_ID });
+  }
+
+  if (!aiResult) {
+    await pushAgentEventNow({
+      type: 'error',
+      message: 'AI 无响应'
+    });
+    return res.json({ success: true, mode: 'chat', intent: 'chat', answer: 'AI 无响应，请稍后重试。', sessionId: body.sessionId || RUNTIME_SESSION_ID });
+  }
 
   const rawAnswer = aiResult.content || '我没有生成有效回复。';
   const selection = extractTaskSelection(rawAnswer, message, indicators);
