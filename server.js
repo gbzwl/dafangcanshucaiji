@@ -20,30 +20,19 @@ import iconv from 'iconv-lite';
 import { fileURLToPath } from 'url';
 import { getAvailableDisks } from './core/scanner.js';
 import {
-  scanReferenceFilesWithProgress,
-  scanFileGlobsWithProgress,
-  scanAllLogFilesWithProgressOptions,
-  buildFileGlobCandidates,
   initIndex,
   buildFileIndex,
   checkIndexStatus
 } from './core/matcher.js';
-import { extractParameter, batchExtractWithProgress } from './core/extractor.js';
-import { parseTemplate, generateResultExcel, generateTemplateExample, generateKnowledgeImportTemplateExample } from './core/excel-handler.js';
-import { callAI, callAIStream, getAvailableBackends, extractJSON, testAIConnection, normalizeAIOptions } from './core/ai-service.js';
-import { aiMatchParameter, aiBatchMatch } from './core/ai-matcher.js';
-import { discoverUnknownParameters, scanLogFiles, extractFieldsFromFile } from './core/ai-discoverer.js';
-import { generateTemplate, saveTemplateToExcel, extractAvailableFields } from './core/ai-template-gen.js';
+import { parseTemplate, generateResultExcel, generateKnowledgeImportTemplateExample } from './core/excel-handler.js';
+import { callAIStream, extractJSON, testAIConnection, normalizeAIOptions } from './core/ai-service.js';
 import {
   initExperienceDB,
-  getVendorDevices,
   saveCollectionRecord,
   getAllRecords,
   getRecordDetail,
-  findMatchingRecords,
   updateRecord,
   deleteRecord,
-  deleteRecords,
   importRawExperienceWorkbook,
   getRawExperienceRecords,
   updateRawExperienceRecord,
@@ -51,21 +40,97 @@ import {
   getRawExperienceByIds,
   saveKnowledgeCandidate,
   getKnowledgeCandidates,
-  getKnowledgeCandidatesByIds,
-  updateKnowledgeCandidateValidation,
-  deleteKnowledgeCandidate,
   clearKnowledgeCandidates
 } from './core/experience-library.js';
-import { validateKnowledgeCandidates } from './core/knowledge-validator.js';
 import { runAgentCollection } from './core/agent-runner.js';
 import { getIndicatorCatalog, getIndicatorTemplatePath, listIndicatorCatalogs, normalizeDeviceType } from './core/indicator-catalog.js';
-import { initAgentStore, listGeneratedTools } from './core/agent-store.js';
+import {
+  initAgentStore,
+  listGeneratedTools,
+  listApiProfiles,
+  getActiveApiProfile,
+  getApiProfile,
+  saveApiProfile,
+  activateApiProfile,
+  deleteApiProfile,
+  ensureAgentSession,
+  getAgentSessionContext,
+  appendAgentMessage,
+  getAgentMessages,
+  closeAgentSession,
+  saveAgentMemory
+} from './core/agent-store.js';
+
+function persistCollectionKnowledge(recordId, body = {}) {
+  const summary = { verified: 0, pending: 0, failed: 0, candidates: [] };
+  for (const rule of body.rules || []) {
+    const status = rule.status === 'user_verified'
+      ? 'verified'
+      : rule.status === 'needs_review' ? 'needs_review' : 'failed';
+    summary[status === 'verified' ? 'verified' : status === 'needs_review' ? 'pending' : 'failed']++;
+
+    if (status === 'verified') {
+      saveAgentMemory({
+        memoryType: 'user_verified_result',
+        deviceType: body.deviceType || '',
+        vendor: body.vendor || '',
+        model: body.model || '',
+        indicatorId: rule.indicatorCode || rule.indicator_code || '',
+        indicatorName: rule.indicator || '',
+        title: `${rule.indicator || '指标'}：人工确认`,
+        content: JSON.stringify({
+          value: rule.value || '',
+          filePath: rule.filePattern || rule.file_path || rule.actualPath || '',
+          matchedKeyword: rule.keyword || '',
+          meaning: rule.keywordMeaning || rule.keyword_meaning || ''
+        }),
+        sourceTaskId: String(recordId || ''),
+        evidence: rule.evidence ? [{ content: rule.evidence, fileMtime: rule.fileMtime || rule.file_mtime || '' }] : [],
+        confidence: rule.confidence || 0,
+        status: 'verified'
+      });
+    }
+
+    const sourcePath = rule.actualPath || rule.filePath || rule.file_path || rule.filePattern || '';
+    const candidate = saveKnowledgeCandidate({
+      sourceRecordId: recordId,
+      vendor: body.vendor || '',
+      deviceType: body.deviceType || '',
+      model: body.model || '',
+      indicatorName: rule.indicator || '',
+      indicatorCode: rule.indicatorCode || rule.indicator_code || '',
+      ruleType: inferRuleTypeFromPath(sourcePath),
+      parserType: inferParserType([sourcePath], [path.basename(sourcePath)]),
+      filePatterns: sourcePath ? [sourcePath.replace(/^[a-z]:[\\/]/i, '')] : [],
+      fileNamePatterns: sourcePath ? [path.basename(sourcePath)] : [],
+      keywords: [rule.keyword || '', ...(Array.isArray(rule.synonyms) ? rule.synonyms : String(rule.synonyms || '').split(/[;；,，]/))].filter(Boolean),
+      operation: status === 'failed' ? 'avoid_failed_path' : 'extract_value',
+      meaning: rule.keywordMeaning || rule.keyword_meaning || rule.reason || '',
+      evidenceExample: rule.evidence || '',
+      aiReason: `来源：采集记录 #${recordId}；状态：${status}`,
+      confidence: rule.confidence || 0,
+      status,
+      createdBy: 'collection_result'
+    });
+    summary.candidates.push(candidate);
+  }
+  return summary;
+}
+
+function inferRuleTypeFromPath(filePath = '') {
+  const lower = String(filePath || '').toLowerCase();
+  if (/\.(xml|html?)$/.test(lower)) return 'xml_selector';
+  if (/\.(log|txt|csv|gz)$/.test(lower)) return 'text_keyword';
+  return 'unknown';
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 9091;
+const RUNTIME_SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+const knowledgeGenerationJobs = new Map();
 
 // 中间件
 app.use(cors());
@@ -83,7 +148,9 @@ const upload = multer({
 });
 
 // 目录初始化
-const TEMP_DIR = path.join(__dirname, 'temp');
+const TEMP_DIR = process.env.APP_DATA_DIR
+  ? path.resolve(process.env.APP_DATA_DIR)
+  : path.join(__dirname, 'temp');
 const TEMPLATES_DIR = path.join(__dirname, 'templates');
 const EXPERIENCE_DIR = path.join(__dirname, 'experiences');
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -91,22 +158,26 @@ if (!fs.existsSync(TEMPLATES_DIR)) fs.mkdirSync(TEMPLATES_DIR, { recursive: true
 if (!fs.existsSync(EXPERIENCE_DIR)) fs.mkdirSync(EXPERIENCE_DIR, { recursive: true });
 
 let agentRuntimeConfig = {
+  profileId: 0,
   provider: 'api',
   backend: 'api',
   baseUrl: process.env.AI_BASE_URL || 'https://api.deepseek.com',
   model: process.env.AI_MODEL || 'deepseek-chat',
-  apiKey: '',
+  apiKey: process.env.AI_API_KEY || process.env.DEEPSEEK_API_KEY || '',
   outputMode: 'auto'
 };
 
-initAgentStore(TEMP_DIR).then(() => {
-  console.log('Agent 任务与记忆数据库已初始化');
+const agentStoreReady = initAgentStore(TEMP_DIR).then(() => {
+  const savedProfile = getActiveApiProfile();
+  if (savedProfile) agentRuntimeConfig = runtimeConfigFromProfile(savedProfile);
+  console.log('Agent 任务、记忆与 API 配置数据库已初始化');
 }).catch(err => {
   console.warn('Agent 数据库初始化失败:', err.message);
+  throw err;
 });
 
 // 初始化采集经验库
-initExperienceDB().then(() => {
+initExperienceDB(TEMP_DIR).then(() => {
   console.log('采集经验库已初始化');
 }).catch(err => {
   console.warn('经验库初始化失败:', err.message);
@@ -122,96 +193,54 @@ initIndex(TEMP_DIR).then(() => {
   indexReady = true; // 即使索引失败也允许服务运行
 });
 
-// AI 智能补全辅助函数
-async function aiSmartFill(indicator, vendor, deviceType) {
-  try {
-    const prompt = `你是MRI/CT医疗设备日志分析专家。请根据以下信息，为采集指标生成搜索规则。
-
-指标名称：${indicator}
-设备厂商：${vendor || '未知'}
-设备类型：${deviceType || '未知'}
-
-请分析该指标可能对应的：
-1. 参考文件路径关键词（如 MedCom/log, MriSiteData, SysUtil, LogData 等）
-2. 标准关键词（日志中可能出现的英文字段名）
-3. 备用关键词（同义词，用分号分隔）
-
-只返回JSON格式，不要其他内容：
-{"filePattern": "参考文件路径关键词", "keyword": "标准关键词", "synonyms": "备用关键词1;备用关键词2"}
-
-如果无法确定，返回空字符串。`;
-
-    const result = await callAI(prompt, { maxTokens: 200 });
-
-    // 尝试解析 JSON 响应
-    const jsonMatch = result.response?.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
-      return {
-        filePattern: parsed.filePattern || '',
-        keyword: parsed.keyword || '',
-        synonyms: parsed.synonyms || ''
-      };
-    }
-
-    return { filePattern: '', keyword: '', synonyms: '' };
-  } catch (err) {
-    console.warn('AI 智能补全失败:', err.message);
-    return { filePattern: '', keyword: '', synonyms: '' };
-  }
-}
-
 // ============ API 路由 ============
 
 // 健康检查
-function buildKnowledgeCandidatePrompt(record) {
-  return `你是医疗设备日志采集知识库设计助手。
-请把一条旧采集经验拆解成“候选知识规则”。候选规则只是草稿，后续必须由程序工具验证，不能把样例路径或样例值当成永久固定规则。
+function buildKnowledgeCandidateBatchPrompt(records) {
+  return `你是医疗设备日志采集知识库设计助手。请批量拆解以下旧采集经验，每条输入对应一条候选知识规则。
+候选规则只是线索，不能把样例盘符、样例值或中文说明当作固定关键字。keywords 只允许英文、数字或符号。
+只返回 JSON，不要 Markdown。格式：{"items":[{"rawExperienceId":1,"ruleType":"text_keyword","parserType":"text","filePatterns":[],"fileNamePatterns":[],"keywords":[],"selector":"","operation":"search_text","valuePattern":"","meaning":"","evidenceExample":"","confidence":0,"aiReason":""}]}
 
-原始经验：
-- 厂商：${record.vendor || ''}
-- 设备类型：${record.deviceType || ''}
-- 型号：${record.model || ''}
-- 中文指标名：${record.indicatorName || ''}
-- 指标标识：${record.indicatorCode || ''}
-- 原始文件路径：${record.filePathRaw || ''}
-- 已拆路径片段：${(record.pathFragments || []).join(' | ')}
-- 已拆文件名：${(record.fileNames || []).join(' | ')}
-- 扩展名：${(record.extensions || []).join(' | ')}
-- 关键字及含义/证据摘要：${record.keywordMeaningRaw || ''}
-- 数据来源：${record.dataSourceRaw || ''}
-- 备注：${record.noteRaw || ''}
+输入：
+${JSON.stringify(records.map(record => ({
+    rawExperienceId: record.id,
+    vendor: record.vendor,
+    deviceType: record.deviceType,
+    model: record.model,
+    indicatorName: record.indicatorName,
+    indicatorCode: record.indicatorCode,
+    filePath: record.filePathRaw,
+    pathFragments: record.pathFragments,
+    fileNames: record.fileNames,
+    keywordMeaning: record.keywordMeaningRaw,
+    value: record.value,
+    matchedKeyword: record.matchedKeyword,
+    evidence: record.evidence
+  })), null, 2)}`;
+}
 
-允许的 ruleType：
-xml_selector, text_keyword, first_last_rows, row_count, column_sum, file_presence, composite_summary, unavailable_reason, unknown
-
-字段说明：
-- filePatterns：去掉盘符后的路径片段或通用路径模式，不要写死盘符。
-- fileNamePatterns：文件名或文件名通配符。
-- keywords：只放真正可能在文件里出现的英文/数字/符号关键字，不要放中文解释。
-- selector：XML/HTML/结构化字段路径，例如 GeneralInfo.SerialNumber。
-- operation：extract_value / search_text / count_rows / first_row / last_row / first_last_rows / sum_column / check_presence / summarize / unavailable。
-- valuePattern：如果适合正则提取，写正则；不确定就留空。
-- meaning：中文说明，说明这个规则为什么可能能采到该指标。
-- evidenceExample：保留原始证据里的关键片段或示例。
-- confidence：0-100，表示候选规则可信度。空路径、空证据、需要外部数据库时应较低。
-- aiReason：简短说明拆解原因和待验证点。
-
-只返回 JSON，不要 Markdown，不要额外解释。格式：
-{
-  "ruleType": "xml_selector",
-  "parserType": "xml",
-  "filePatterns": [],
-  "fileNamePatterns": [],
-  "keywords": [],
-  "selector": "",
-  "operation": "",
-  "valuePattern": "",
-  "meaning": "",
-  "evidenceExample": "",
-  "confidence": 0,
-  "aiReason": ""
-}`;
+function buildBaselineCandidate(record) {
+  const keywords = normalizeCandidateKeywords(record.matchedKeyword || '');
+  return {
+    rawExperienceId: record.id,
+    vendor: record.vendor,
+    deviceType: record.deviceType,
+    model: record.model,
+    indicatorName: record.indicatorName,
+    indicatorCode: record.indicatorCode,
+    ruleType: inferRuleTypeFromPath(record.filePathRaw || record.fileNames?.[0] || ''),
+    parserType: inferParserType(record.pathFragments || [], record.fileNames || []),
+    filePatterns: record.pathFragments || [],
+    fileNamePatterns: record.fileNames || [],
+    keywords,
+    operation: keywords.length ? 'search_text' : 'unknown',
+    meaning: record.keywordMeaningRaw || '',
+    evidenceExample: record.evidence || record.keywordMeaningRaw || '',
+    aiReason: '由旧表字段直接形成的基础经验，等待模型提炼和新设备验证',
+    confidence: record.filePathRaw && (record.keywordMeaningRaw || record.evidence) ? 55 : 30,
+    status: 'draft',
+    createdBy: 'program:legacy_import'
+  };
 }
 
 function normalizeGeneratedCandidate(record, parsed, aiResult = {}) {
@@ -259,12 +288,14 @@ async function generateKnowledgeCandidatesForRecords(records = [], options = {})
   const selectedRecords = records.slice(0, Math.max(1, Number(limit) || 10));
   const generated = [];
   const failures = [];
+  const batchSize = 8;
 
-  for (const record of selectedRecords) {
+  for (let offset = 0; offset < selectedRecords.length; offset += batchSize) {
+    const batch = selectedRecords.slice(offset, offset + batchSize);
     try {
-      const prompt = buildKnowledgeCandidatePrompt(record);
+      const prompt = buildKnowledgeCandidateBatchPrompt(batch);
       if (dryRun) {
-        generated.push({ rawExperienceId: record.id, prompt });
+        generated.push({ rawExperienceIds: batch.map(record => record.id), prompt });
         continue;
       }
 
@@ -278,33 +309,32 @@ async function generateKnowledgeCandidatesForRecords(records = [], options = {})
             apiKey,
             model: modelName || aiModel || undefined
           }),
-          maxTokens: 1200,
-          timeout: 60000,
+          maxTokens: 6000,
+          timeout: 5 * 60 * 1000,
           formatJson: false
         }
       );
       const parsed = extractJSON(aiResult.content);
-      if (!parsed) {
-        failures.push({
-          rawExperienceId: record.id,
-          indicator: record.indicatorName || '',
-          error: 'AI 未返回有效 JSON'
-        });
+      const items = Array.isArray(parsed) ? parsed : parsed?.items;
+      if (!Array.isArray(items)) {
+        failures.push(...batch.map(record => ({ rawExperienceId: record.id, indicator: record.indicatorName || '', error: 'AI 未返回有效批量 JSON' })));
         continue;
       }
 
-      const candidate = normalizeGeneratedCandidate(record, parsed, aiResult);
-      if (replaceExistingDraft && record.id) {
-        clearKnowledgeCandidates({ rawExperienceId: record.id, status: 'draft' });
+      for (const record of batch) {
+        const item = items.find(entry => Number(entry.rawExperienceId) === Number(record.id));
+        if (!item) {
+          failures.push({ rawExperienceId: record.id, indicator: record.indicatorName || '', error: 'AI 批量结果缺少对应记录' });
+          continue;
+        }
+        const candidate = normalizeGeneratedCandidate(record, item, aiResult);
+        if (replaceExistingDraft && record.id) clearKnowledgeCandidates({ rawExperienceId: record.id, status: 'draft' });
+        generated.push(saveKnowledgeCandidate(candidate));
       }
-      generated.push(saveKnowledgeCandidate(candidate));
     } catch (error) {
-      failures.push({
-        rawExperienceId: record.id,
-        indicator: record.indicatorName || '',
-        error: error.message
-      });
+      failures.push(...batch.map(record => ({ rawExperienceId: record.id, indicator: record.indicatorName || '', error: error.message })));
     }
+    options.onProgress?.({ processed: Math.min(offset + batch.length, selectedRecords.length), total: selectedRecords.length, generated: generated.length, failed: failures.length });
   }
 
   return {
@@ -380,6 +410,7 @@ function mergeAgentAIOptions(options = {}) {
 function normalizeAgentConfigInput(input = {}) {
   const baseUrl = input.baseUrl || input.url || defaultBaseUrl();
   return {
+    profileId: Number(input.profileId || 0),
     provider: 'api',
     backend: 'api',
     baseUrl,
@@ -391,12 +422,27 @@ function normalizeAgentConfigInput(input = {}) {
 
 function publicAgentConfig(config = agentRuntimeConfig) {
   return {
+    profileId: Number(config.profileId || config.id || 0),
     provider: config.provider,
     backend: config.backend,
     baseUrl: config.baseUrl,
     model: config.model,
     hasApiKey: !!config.apiKey,
+    apiKeyHint: config.apiKeyHint || '',
     outputMode: config.outputMode || 'auto'
+  };
+}
+
+function runtimeConfigFromProfile(profile) {
+  return {
+    profileId: Number(profile.id || 0),
+    provider: 'api',
+    backend: 'api',
+    baseUrl: profile.baseUrl || defaultBaseUrl(),
+    model: profile.model || defaultModel(),
+    apiKey: profile.apiKey || '',
+    apiKeyHint: profile.apiKeyHint || '',
+    outputMode: profile.outputMode || 'auto'
   };
 }
 
@@ -414,45 +460,51 @@ function normalizeAgentResultsForExcel(results = []) {
     value: item.value || (item.status === 'success' ? '已采集' : '未找到'),
     file_path: item.filePath || item.file_path || '',
     matchedKeyword: item.matchedKeyword || item.matched_keyword || '',
+    synonyms: item.synonyms || [],
     keywordMeaning: item.keywordMeaning || item.keyword_meaning || item.reason || '',
     match_line: item.evidence || item.match_line || '',
     dataTimestamp: item.dataTimestamp || item.data_timestamp || '',
     fileMtime: item.fileMtime || item.file_mtime || '',
     evidenceLevel: item.evidenceLevel || item.evidence_level || 'NONE',
     confidence: item.confidence || 0,
-    matchMethod: `Agent ${item.status || 'unknown'}`,
+    matchMethod: item.matchMethod || item.match_method || `Agent ${item.status || 'unknown'}`,
+    sourceType: item.sourceType || item.source_type || 'agent_collection',
     success: item.status === 'success'
   }));
 }
 
-function normalizeAgentCollectionBody(body = {}) {
+function normalizeAgentCollectionBody(body = {}, sessionContext = {}) {
+  const allIndicators = body.indicators || body.rules || [];
+  const explicit = filterIndicatorsByInstruction(allIndicators, body.message || body.instruction || '');
+  const selectedIds = Array.isArray(sessionContext.selectedIndicatorIds) ? sessionContext.selectedIndicatorIds : [];
+  const selected = selectedIds.length
+    ? allIndicators.filter(item => selectedIds.includes(String(item?.indicatorId || item?.id || '').trim()))
+    : [];
   return {
     roots: body.roots || body.diskRoots || (body.diskRoot ? [body.diskRoot] : []),
-    indicators: filterIndicatorsByInstruction(body.indicators || body.rules || [], body.message || body.instruction || ''),
+    indicators: explicit.selectionWasExplicit ? explicit.indicators : (selected.length ? selected : explicit.indicators),
     vendor: body.vendor || '',
     deviceType: body.deviceType || '',
     model: body.deviceModel || body.machineModel || body.model || '',
-    maxSteps: body.maxSteps,
-    maxCandidates: body.maxCandidates,
-    maxResultChars: body.maxResultChars,
-    maxDurationMs: body.maxDurationMs,
     dryRun: body.dryRun,
     agentProfile: body.agentProfile || ''
   };
 }
 
 function filterIndicatorsByInstruction(indicators = [], instruction = '') {
-  if (!Array.isArray(indicators)) return [];
+  if (!Array.isArray(indicators)) return { indicators: [], selectionWasExplicit: false };
 
   const normalizedIndicators = indicators.filter(item => {
     const name = typeof item === 'string' ? item : item?.indicator || item?.name || item?.indicatorName;
     return String(name || '').trim();
   });
-  if (normalizedIndicators.length <= 1) return normalizedIndicators;
+  if (normalizedIndicators.length <= 1) return { indicators: normalizedIndicators, selectionWasExplicit: normalizedIndicators.length === 1 };
 
   const text = String(instruction || '').trim();
-  if (!text) return normalizedIndicators;
-  if (/(全部|所有|全量|当前模板|整张表|每个指标|all)/i.test(text)) return normalizedIndicators;
+  if (!text) return { indicators: normalizedIndicators, selectionWasExplicit: false };
+  if (/(全部|所有|全量|当前模板|整张表|每个指标|all)/i.test(text)) {
+    return { indicators: normalizedIndicators, selectionWasExplicit: true };
+  }
 
   const matched = normalizedIndicators.filter(item => {
     const indicator = String(item.indicator || item.name || item.indicatorName || item || '').trim();
@@ -460,7 +512,10 @@ function filterIndicatorsByInstruction(indicators = [], instruction = '') {
     return isIndicatorMentioned(text, indicator) || (code && isIndicatorMentioned(text, code));
   });
 
-  return matched.length > 0 ? matched : normalizedIndicators;
+  return {
+    indicators: matched.length > 0 ? matched : normalizedIndicators,
+    selectionWasExplicit: matched.length > 0
+  };
 }
 
 function isIndicatorMentioned(text, indicator) {
@@ -477,8 +532,8 @@ function isIndicatorMentioned(text, indicator) {
   return false;
 }
 
-async function executeAgentCollection(body = {}, signal = null) {
-  const request = normalizeAgentCollectionBody(body);
+async function executeAgentCollection(body = {}, signal = null, sessionContext = {}) {
+  const request = normalizeAgentCollectionBody(body, sessionContext);
 
   if (!Array.isArray(request.roots) || request.roots.length === 0) {
     throw new Error('请先选择目标磁盘，然后再开始采集。');
@@ -515,10 +570,6 @@ async function executeAgentCollection(body = {}, signal = null) {
     roots: request.roots,
     indicators: request.indicators,
     aiOptions,
-    maxSteps: request.maxSteps,
-    maxCandidates: request.maxCandidates,
-    maxResultChars: request.maxResultChars,
-    maxDurationMs: request.maxDurationMs,
     dryRun: request.dryRun,
     agentProfile: request.agentProfile
   }, {
@@ -578,8 +629,8 @@ function detectAgentIntent(message = '') {
   return 'chat';
 }
 
-function getAgentCollectPreflightMessage(body = {}) {
-  const { roots, indicators } = normalizeAgentCollectionBody(body);
+function getAgentCollectPreflightMessage(body = {}, sessionContext = {}) {
+  const { roots, indicators } = normalizeAgentCollectionBody(body, sessionContext);
   const missing = [];
   if (!Array.isArray(roots) || roots.length === 0) missing.push('目标磁盘');
   if (!Array.isArray(indicators) || indicators.length === 0) missing.push('设备类型和采集指标');
@@ -587,26 +638,36 @@ function getAgentCollectPreflightMessage(body = {}) {
   return `现在还不能开始采集，请先补充：${missing.join('、')}。`;
 }
 
-function buildAgentConfigAnswer(body = {}) {
-  const aiOptions = mergeAgentAIOptions({
-    provider: body.provider,
-    backend: body.backend,
-    baseUrl: body.baseUrl,
-    apiKey: body.apiKey,
-    model: body.modelName || body.aiModel
-  });
-  const normalized = normalizeAIOptions(aiOptions);
-  return [
-    `当前配置的大模型服务商是 ${normalized.provider}。`,
-    `模型名称是 ${normalized.model || '未填写'}。`,
-    `Base URL 是 ${normalized.baseUrl || '未填写'}。`,
-    `API Key ${normalized.hasApiKey ? '已配置' : '未配置'}。`
-  ].join('\n');
+function selectConversationHistory(messages = [], maxChars = 60000) {
+  const selected = [];
+  let used = 0;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const item = messages[index];
+    const size = String(item.content || '').length;
+    if (selected.length > 0 && used + size > maxChars) break;
+    selected.unshift(item);
+    used += size;
+  }
+  return selected;
 }
 
 async function answerAgentChat(body = {}, signal = null) {
   const message = String(body.message || body.instruction || '').trim();
   const roots = Array.isArray(body.roots) ? body.roots : (body.roots ? [body.roots] : []);
+  const indicators = Array.isArray(body.indicators)
+    ? body.indicators
+      .map((item, index) => ({
+        sequence: index + 1,
+        indicatorId: String(item?.indicatorId || item?.id || '').trim(),
+        indicator: String(item?.indicator || item?.name || item?.indicatorName || '').trim(),
+        indicatorCode: String(item?.indicatorCode || item?.indicator_code || item?.code || '').trim(),
+        enabled: item?.enabled !== false
+      }))
+      .filter(item => item.indicator)
+    : [];
+  const indicatorContext = indicators.length > 0
+    ? JSON.stringify(indicators, null, 2)
+    : '当前没有加载采集指标。';
   const aiOptions = mergeAgentAIOptions({
     provider: body.provider,
     backend: body.backend,
@@ -614,43 +675,88 @@ async function answerAgentChat(body = {}, signal = null) {
     apiKey: body.apiKey,
     model: body.modelName || body.aiModel,
     temperature: body.temperature,
-    maxTokens: body.maxTokens || 800,
+    maxTokens: body.maxTokens || 2000,
     timeout: body.timeout,
     outputMode: body.outputMode
   });
   if (signal) aiOptions.signal = signal;
 
-  const prompt = `你是大放设备参数采集工具里的 Agent 助手。
-你可以回答用户关于模型配置、采集流程、知识库、模板字段、操作方式的问题。
-如果用户没有明确要求开始采集，不要假装已经扫描磁盘，也不要输出采集结果。
+  const systemPrompt = `你是大放设备参数采集工具里的 Agent 助手。你需要像正常对话助手一样理解连续对话、代词和追问。
+你可以进行自然对话，也可以回答用户关于模型配置、采集流程、知识库、模板字段和操作方式的问题。
+只有用户明确要求开始采集时才进入采集流程。普通对话中不要假装已经扫描磁盘，也不要编造文件或采集结果。
+如果用户在对话中定义、选择或确认了本次只采集一部分指标，请在正常回答末尾追加一行：
+<<TASK_SELECTION_JSON>>{"indicatorIds":["指标ID"]}<</TASK_SELECTION_JSON>>
+indicatorIds 必须来自下方指标预览表。没有形成明确子集时不要追加。该行只供程序保存任务范围，界面不会展示。
 
-当前上下文：
+本次设备上下文：
 - 厂商：${body.vendor || ''}
 - 设备类型：${body.deviceType || ''}
 - 型号：${body.model || ''}
 - 已选根目录：${roots.join(' | ')}
-- 当前采集指标数：${Array.isArray(body.indicators) ? body.indicators.length : 0}
+- 当前采集指标数：${indicators.length}
 - 当前模型：${aiOptions.provider} / ${aiOptions.model || '未填写'}
 - 输出模式：${aiOptions.outputMode || 'auto'}
 
+当前采集指标预览表（这是待采集任务，不代表已经取得结果）：
+${indicatorContext}
+
 Agent 个性化设定：
-${body.agentProfile || '未设置'}
+${body.agentProfile || '未设置'}`;
+  const storedHistory = getAgentMessages(body.sessionId || RUNTIME_SESSION_ID, 200)
+    .filter(item => item.role === 'user' || item.role === 'assistant')
+    .map(item => ({ role: item.role, content: item.content }));
+  const history = selectConversationHistory(storedHistory);
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history
+  ];
 
-用户问题：${message}`;
-
-  const aiResult = await callAIStream(prompt, {
+  await pushAgentEventNow({
+    type: 'chat_processing',
+    message: `已载入本次会话的 ${history.length} 条消息，正在交给模型分析`
+  });
+  const aiResult = await callAIStream(message, {
     ...aiOptions,
+    messages,
     formatJson: false,
     temperature: 0.3,
-    maxTokens: 800
-  }, token => {
+    maxTokens: body.maxTokens || 2000
+  }, (token, meta = {}) => {
     pushAgentEvent({
-      type: 'model_delta',
+      type: meta.type === 'reasoning' ? 'model_reasoning_delta' : 'model_delta',
       content: token
     });
   });
 
-  return aiResult.content || '我没有生成有效回复。';
+  const rawAnswer = aiResult.content || '我没有生成有效回复。';
+  const selection = extractTaskSelection(rawAnswer, message, indicators);
+  return {
+    answer: rawAnswer.replace(/<<TASK_SELECTION_JSON>>[\s\S]*?<\/TASK_SELECTION_JSON>>/g, '').trim(),
+    selectedIndicatorIds: selection
+  };
+}
+
+function extractTaskSelection(answer, userMessage, indicators = []) {
+  const marker = String(answer || '').match(/<<TASK_SELECTION_JSON>>([\s\S]*?)<\/TASK_SELECTION_JSON>>/);
+  if (marker) {
+    try {
+      const parsed = JSON.parse(marker[1]);
+      const allowed = new Set(indicators.map(item => item.indicatorId));
+      const ids = [...new Set((parsed.indicatorIds || []).map(String).filter(id => allowed.has(id)))];
+      if (ids.length > 0 && ids.length < indicators.length) return ids;
+    } catch {}
+  }
+
+  const combined = `${userMessage || ''}\n${answer || ''}`;
+  const mentioned = indicators.filter(item =>
+    isIndicatorMentioned(combined, item.indicatorId)
+    || isIndicatorMentioned(combined, item.indicator)
+    || isIndicatorMentioned(combined, item.indicatorCode)
+  ).map(item => item.indicatorId);
+  const subsetLanguage = /(只|仅|这组|这一组|任务|重点|共\s*\d+\s*(个|项|条)|包含\s*\d+\s*(个|项|条))/i.test(combined);
+  return subsetLanguage && mentioned.length > 0 && mentioned.length < indicators.length
+    ? [...new Set(mentioned)]
+    : [];
 }
 
 app.get('/api/v1/health', (req, res) => {
@@ -658,7 +764,8 @@ app.get('/api/v1/health', (req, res) => {
     status: 'ok',
     version: '4.0.0',
     platform: process.platform,
-    indexReady
+    indexReady,
+    sessionId: RUNTIME_SESSION_ID
   });
 });
 
@@ -666,6 +773,17 @@ app.get('/api/v1/health', (req, res) => {
 app.get('/api/v1/indicator-catalogs', (req, res) => {
   try {
     res.json({ success: true, catalogs: listIndicatorCatalogs(TEMPLATES_DIR) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/v1/agent/session/:id/messages', async (req, res) => {
+  try {
+    await agentStoreReady;
+    const sessionId = req.params.id || RUNTIME_SESSION_ID;
+    ensureAgentSession(sessionId);
+    res.json({ success: true, sessionId, messages: getAgentMessages(sessionId, 200) });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -702,16 +820,50 @@ app.post('/api/v1/tools/:name', async (req, res) => {
   res.status(410).json({ success: false, error: '固定工具调用接口已停用，工具由外部 API 在 Agent 任务中动态生成' });
 });
 
-app.get('/api/v1/agent/config', (req, res) => {
-  res.json({ success: true, config: publicAgentConfig(agentRuntimeConfig) });
-});
-
-app.post('/api/v1/agent/config', (req, res) => {
+app.get('/api/v1/agent/config', async (req, res) => {
   try {
-    agentRuntimeConfig = normalizeAgentConfigInput(req.body || {});
+    await agentStoreReady;
     res.json({
       success: true,
-      config: publicAgentConfig(agentRuntimeConfig)
+      config: publicAgentConfig(agentRuntimeConfig),
+      profiles: listApiProfiles()
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/v1/agent/config', async (req, res) => {
+  try {
+    await agentStoreReady;
+    const profileId = Number(req.body?.profileId || 0);
+    if (profileId) {
+      agentRuntimeConfig = runtimeConfigFromProfile(activateApiProfile(profileId));
+    } else {
+      agentRuntimeConfig = normalizeAgentConfigInput(req.body || {});
+    }
+    res.json({
+      success: true,
+      config: publicAgentConfig(agentRuntimeConfig),
+      profiles: listApiProfiles()
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+app.delete('/api/v1/agent/config/:id', async (req, res) => {
+  try {
+    await agentStoreReady;
+    const result = deleteApiProfile(req.params.id);
+    if (!result.deleted) return res.status(404).json({ success: false, error: 'API 历史配置不存在' });
+    agentRuntimeConfig = result.active
+      ? runtimeConfigFromProfile(result.active)
+      : normalizeAgentConfigInput({ apiKey: process.env.AI_API_KEY || process.env.DEEPSEEK_API_KEY || '' });
+    res.json({
+      success: true,
+      config: publicAgentConfig(agentRuntimeConfig),
+      profiles: listApiProfiles()
     });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
@@ -720,14 +872,25 @@ app.post('/api/v1/agent/config', (req, res) => {
 
 app.post('/api/v1/agent/test', async (req, res) => {
   try {
-    const input = normalizeAgentConfigInput(req.body || {});
+    await agentStoreReady;
+    const body = req.body || {};
+    const sourceProfile = body.profileId ? getApiProfile(body.profileId) : null;
+    const input = normalizeAgentConfigInput({
+      ...body,
+      apiKey: body.apiKey || sourceProfile?.apiKey || ''
+    });
     const result = await testAIConnection(input);
     if (result.success) {
-      agentRuntimeConfig = input;
+      const savedProfile = saveApiProfile({
+        ...input,
+        sourceProfileId: body.profileId || 0
+      });
+      agentRuntimeConfig = runtimeConfigFromProfile(savedProfile);
     }
     res.json({
       ...result,
-      config: publicAgentConfig(input)
+      config: publicAgentConfig(result.success ? agentRuntimeConfig : input),
+      profiles: result.success ? listApiProfiles() : undefined
     });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
@@ -749,17 +912,53 @@ app.post('/api/v1/raw-experience/import', upload.single('file'), async (req, res
     });
 
     const shouldGenerate = String(req.body.generateCandidates ?? 'true') !== 'false';
-    let candidateResult = { generated: [], failures: [], count: 0, failCount: 0 };
+    const generationOptions = {
+      provider: req.body.provider || req.body.backend || '',
+      backend: req.body.backend || req.body.provider || '',
+      baseUrl: req.body.baseUrl || '',
+      apiKey: req.body.apiKey || '',
+      aiModel: req.body.aiModel || '',
+      modelName: req.body.modelName || '',
+      limit: result.records.length,
+      replaceExistingDraft: true
+    };
+    const baselineCandidates = result.records.map(record => {
+      clearKnowledgeCandidates({ rawExperienceId: record.id, status: 'draft' });
+      return saveKnowledgeCandidate(buildBaselineCandidate(record));
+    });
+    let generationJobId = '';
     if (shouldGenerate && result.records.length > 0) {
-      candidateResult = await generateKnowledgeCandidatesForRecords(result.records, {
-        provider: req.body.provider || req.body.backend || '',
-        backend: req.body.backend || req.body.provider || '',
-        baseUrl: req.body.baseUrl || '',
-        apiKey: req.body.apiKey || '',
-        aiModel: req.body.aiModel || '',
-        modelName: req.body.modelName || '',
-        limit: result.records.length,
-        replaceExistingDraft: true
+      generationJobId = `knowledge_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const job = {
+        id: generationJobId,
+        status: 'queued',
+        total: result.records.length,
+        processed: 0,
+        generated: 0,
+        failed: 0,
+        startedAt: new Date().toISOString(),
+        finishedAt: '',
+        error: ''
+      };
+      knowledgeGenerationJobs.set(generationJobId, job);
+      setImmediate(() => {
+        job.status = 'running';
+        generateKnowledgeCandidatesForRecords(result.records, {
+          ...generationOptions,
+          onProgress: progress => Object.assign(job, progress)
+        }).then(generation => {
+          Object.assign(job, {
+            status: generation.failCount ? 'completed_with_errors' : 'completed',
+            processed: result.records.length,
+            generated: generation.count,
+            failed: generation.failCount,
+            failureSummary: generation.failureSummary,
+            finishedAt: new Date().toISOString()
+          });
+        }).catch(error => {
+          Object.assign(job, { status: 'failed', error: error.message, finishedAt: new Date().toISOString() });
+          console.error('后台知识规则生成失败:', error.message);
+        });
       });
     }
 
@@ -768,11 +967,9 @@ app.post('/api/v1/raw-experience/import', upload.single('file'), async (req, res
       filename: decodedFilename,
       count: result.count,
       sheets: result.sheets,
-      generated: candidateResult.generated,
-      failures: candidateResult.failures,
-      failureSummary: candidateResult.failureSummary || [],
-      generatedCount: candidateResult.count,
-      generateFailCount: candidateResult.failCount,
+      baselineCount: baselineCandidates.length,
+      generationQueued: shouldGenerate && result.records.length > 0,
+      generationJobId,
       preview: result.records.slice(0, 20)
     });
   } catch (err) {
@@ -797,11 +994,27 @@ app.get('/api/v1/raw-experience/list', (req, res) => {
   }
 });
 
+app.get('/api/v1/knowledge-candidates', (req, res) => {
+  try {
+    const records = getKnowledgeCandidates({ ...req.query, limit: Math.min(Number(req.query.limit) || 5000, 10000) });
+    res.json({ success: true, records, count: records.length });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/v1/knowledge-generation/:id', (req, res) => {
+  const job = knowledgeGenerationJobs.get(req.params.id);
+  if (!job) return res.status(404).json({ success: false, error: '知识生成任务不存在或服务已经重启' });
+  res.json({ success: true, job });
+});
+
 app.put('/api/v1/raw-experience/:id', (req, res) => {
   try {
     const record = updateRawExperienceRecord(req.params.id, req.body || {});
     clearKnowledgeCandidates({ rawExperienceId: req.params.id, status: 'draft' });
-    res.json({ success: true, record });
+    const candidate = saveKnowledgeCandidate(buildBaselineCandidate(record));
+    res.json({ success: true, record, candidate });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
   }
@@ -821,196 +1034,6 @@ app.delete('/api/v1/raw-experience', (req, res) => {
   }
 });
 
-app.post('/api/v1/knowledge-candidates/generate', async (req, res) => {
-  try {
-    const {
-      rawExperienceIds = [],
-      vendor = '',
-      deviceType = '',
-      model = '',
-      indicator = '',
-      limit = 10,
-      backend = '',
-      provider = '',
-      baseUrl = '',
-      apiKey = '',
-      aiModel = '',
-      modelName = '',
-      dryRun = false,
-      replaceExistingDraft = true
-    } = req.body || {};
-
-    let records = rawExperienceIds.length
-      ? getRawExperienceByIds(rawExperienceIds)
-      : getRawExperienceRecords({ vendor, deviceType, model, indicator, limit });
-
-    records = records.slice(0, Math.max(1, Number(limit) || 10));
-    if (records.length === 0) {
-      return res.status(400).json({ success: false, error: '没有找到可拆解的原始经验记录' });
-    }
-
-    const generated = [];
-    const failures = [];
-    for (const record of records) {
-      try {
-        const prompt = buildKnowledgeCandidatePrompt(record);
-        if (dryRun) {
-          generated.push({ rawExperienceId: record.id, prompt });
-          continue;
-        }
-
-        const aiResult = await callAIStream(
-          prompt,
-          {
-            ...mergeAgentAIOptions({
-              backend,
-              provider,
-              baseUrl,
-              apiKey,
-              model: modelName || aiModel || undefined
-            }),
-            maxTokens: 1200,
-            timeout: 60000,
-            formatJson: false
-          }
-        );
-        const parsed = extractJSON(aiResult.content);
-        if (!parsed) {
-          failures.push({ rawExperienceId: record.id, error: 'AI 未返回有效 JSON' });
-          continue;
-        }
-
-        const candidate = normalizeGeneratedCandidate(record, parsed, aiResult);
-        if (replaceExistingDraft) {
-          clearKnowledgeCandidates({ rawExperienceId: record.id, status: 'draft' });
-        }
-        generated.push(saveKnowledgeCandidate(candidate));
-      } catch (error) {
-        failures.push({ rawExperienceId: record.id, error: error.message });
-      }
-    }
-
-    res.json({
-      success: true,
-      generated,
-      failures,
-      failureSummary: summarizeKnowledgeGenerationFailures(failures),
-      count: generated.length,
-      failCount: failures.length
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get('/api/v1/knowledge-candidates/list', (req, res) => {
-  try {
-    const records = getKnowledgeCandidates({
-      vendor: req.query.vendor || '',
-      deviceType: req.query.deviceType || '',
-      model: req.query.model || '',
-      indicator: req.query.indicator || '',
-      status: req.query.status || '',
-      validationStatus: req.query.validationStatus || '',
-      rawExperienceId: req.query.rawExperienceId || '',
-      limit: req.query.limit || 200
-    });
-    res.json({ success: true, records, count: records.length });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/v1/knowledge-candidates/validate', async (req, res) => {
-  try {
-    const {
-      candidateIds = [],
-      candidates = [],
-      roots = [],
-      root = '',
-      maxFiles = 5000,
-      maxResults = 40,
-      topFiles = 10,
-      maxEvidence = 20,
-      writeBack = false
-    } = req.body || {};
-
-    let records = Array.isArray(candidates) && candidates.length ? candidates : [];
-    if (Array.isArray(candidateIds) && candidateIds.length) {
-      records = getKnowledgeCandidatesByIds(candidateIds);
-    }
-
-    if (records.length === 0) {
-      return res.status(400).json({ success: false, error: '没有可验证的候选知识规则' });
-    }
-
-    const rootList = Array.isArray(roots) && roots.length ? roots : (root ? [root] : []);
-    const results = await validateKnowledgeCandidates(records, {
-      roots: rootList,
-      maxFiles,
-      maxResults,
-      topFiles,
-      maxEvidence
-    });
-
-    const updated = [];
-    if (writeBack) {
-      for (const result of results) {
-        if (!result.candidateId) continue;
-        updated.push(updateKnowledgeCandidateValidation(result.candidateId, result));
-      }
-    }
-
-    res.json({
-      success: true,
-      count: results.length,
-      verifiedCount: results.filter(item => item.status === 'verified').length,
-      updatedCount: updated.length,
-      updated,
-      results
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.delete('/api/v1/knowledge-candidates/:id', (req, res) => {
-  try {
-    deleteKnowledgeCandidate(req.params.id);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.delete('/api/v1/knowledge-candidates', (req, res) => {
-  try {
-    clearKnowledgeCandidates(req.body || {});
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/v1/agent/collect', async (req, res) => {
-  const requestController = new AbortController();
-  req.on('aborted', () => requestController.abort());
-  res.on('close', () => {
-    if (!res.writableEnded) requestController.abort();
-  });
-
-  try {
-    const result = await executeAgentCollection(req.body || {}, requestController.signal);
-    res.json(result);
-  } catch (err) {
-    await pushAgentEventNow({
-      type: 'error',
-      message: err.message
-    });
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
 app.post('/api/v1/agent/chat', async (req, res) => {
   const requestController = new AbortController();
   req.on('aborted', () => requestController.abort());
@@ -1019,9 +1042,17 @@ app.post('/api/v1/agent/chat', async (req, res) => {
   });
 
   try {
+    await agentStoreReady;
     const body = req.body || {};
     const message = String(body.message || body.instruction || '').trim();
     const intent = detectAgentIntent(message);
+    const sessionId = body.sessionId || RUNTIME_SESSION_ID;
+    ensureAgentSession(sessionId, {
+      vendor: body.vendor || '',
+      deviceType: body.deviceType || '',
+      model: body.model || '',
+      roots: Array.isArray(body.roots) ? body.roots : []
+    });
 
     await pushAgentEventNow({
       type: 'chat_intent',
@@ -1032,26 +1063,37 @@ app.post('/api/v1/agent/chat', async (req, res) => {
     if (intent === 'empty') {
       return res.json({ success: true, mode: 'chat', intent, answer: '请输入要交流的问题，或明确告诉我开始采集。' });
     }
-
-    if (intent === 'config') {
-      return res.json({ success: true, mode: 'chat', intent, answer: buildAgentConfigAnswer(body) });
-    }
-
-    if (intent === 'stop') {
-      return res.json({ success: true, mode: 'chat', intent, answer: '当前这条消息已收到。如果正在执行采集，请点击“停止”按钮中止正在运行的请求。' });
-    }
+    appendAgentMessage(sessionId, 'user', message);
+    const sessionContext = getAgentSessionContext(sessionId);
 
     if (intent === 'collect') {
-      const preflightMessage = getAgentCollectPreflightMessage(body);
+      const preflightMessage = getAgentCollectPreflightMessage(body, sessionContext);
       if (preflightMessage) {
-        return res.json({ success: true, mode: 'chat', intent: 'collect_preflight', answer: preflightMessage });
+        appendAgentMessage(sessionId, 'assistant', preflightMessage, { intent: 'collect_preflight' });
+        return res.json({ success: true, mode: 'chat', intent: 'collect_preflight', answer: preflightMessage, sessionId });
       }
-      const result = await executeAgentCollection(body, requestController.signal);
-      return res.json({ ...result, mode: 'collect', intent });
+      const selectedRequest = normalizeAgentCollectionBody(body, sessionContext);
+      await pushAgentEventNow({
+        type: 'selection_confirmed',
+        message: `本次按已确认范围采集 ${selectedRequest.indicators.length} 个指标`,
+        indicatorCount: selectedRequest.indicators.length,
+        indicators: selectedRequest.indicators.map(item => item.indicator || item.name || '')
+      });
+      const result = await executeAgentCollection(body, requestController.signal, sessionContext);
+      const summary = `采集完成：成功 ${result.scanLog?.success_count || 0}/${result.scanLog?.total_indicators || 0}。结果等待人工确认。`;
+      appendAgentMessage(sessionId, 'assistant', summary, { intent: 'collect', taskId: result.taskId || '' });
+      return res.json({ ...result, mode: 'collect', intent, sessionId });
     }
 
-    const answer = await answerAgentChat(body, requestController.signal);
-    res.json({ success: true, mode: 'chat', intent, answer });
+    const chatResult = await answerAgentChat({ ...body, sessionId }, requestController.signal);
+    if (chatResult.selectedIndicatorIds.length) {
+      ensureAgentSession(sessionId, { selectedIndicatorIds: chatResult.selectedIndicatorIds });
+    }
+    appendAgentMessage(sessionId, 'assistant', chatResult.answer, {
+      intent,
+      selectedIndicatorIds: chatResult.selectedIndicatorIds
+    });
+    res.json({ success: true, mode: 'chat', intent, answer: chatResult.answer, selectedIndicatorIds: chatResult.selectedIndicatorIds, sessionId });
   } catch (err) {
     await pushAgentEventNow({
       type: 'error',
@@ -1093,24 +1135,6 @@ app.post('/api/v1/template/upload', upload.single('file'), (req, res) => {
 });
 
 // 下载采集任务模板示例
-app.get('/api/v1/template/example', (req, res) => {
-  try {
-    const outputPath = path.join(TEMP_DIR, 'Collection_Task_Template.xlsx');
-    generateTemplateExample(outputPath);
-    res.download(outputPath, '采集任务模板.xlsx', (err) => {
-      if (err) {
-        res.status(500).json({ success: false, error: '下载失败' });
-      }
-      setTimeout(() => {
-        try { fs.unlinkSync(outputPath); } catch {}
-      }, 60000);
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 下载旧表/知识库导入模板示例
 app.get('/api/v1/raw-experience/template', (req, res) => {
   try {
     const outputPath = path.join(TEMP_DIR, 'Knowledge_Import_Template.xlsx');
@@ -1131,103 +1155,6 @@ app.get('/api/v1/raw-experience/template', (req, res) => {
 // ============ 设备模板管理 ============
 
 // 获取设备模板列表
-app.get('/api/v1/devices', (req, res) => {
-  try {
-    const indexPath = path.join(TEMPLATES_DIR, 'template_index.json');
-    if (!fs.existsSync(indexPath)) {
-      return res.json({ success: true, devices: [] });
-    }
-    const data = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    res.json({ success: true, devices: data.devices || [] });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 加载设备模板
-app.get('/api/v1/devices/:deviceId/template', (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const indexPath = path.join(TEMPLATES_DIR, 'template_index.json');
-
-    if (!fs.existsSync(indexPath)) {
-      return res.status(404).json({ success: false, error: '设备模板索引不存在' });
-    }
-
-    const data = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    const device = (data.devices || []).find(d => d.id === deviceId);
-
-    if (!device) {
-      return res.status(404).json({ success: false, error: `设备 ${deviceId} 不存在` });
-    }
-
-    const templatePath = path.join(TEMPLATES_DIR, device.template);
-    if (!fs.existsSync(templatePath)) {
-      return res.status(404).json({ success: false, error: `模板文件 ${device.template} 不存在` });
-    }
-
-    // 解析模板并返回规则
-    const buffer = fs.readFileSync(templatePath);
-    const rules = parseTemplate(buffer);
-
-    res.json({
-      success: true,
-      device,
-      rules,
-      count: rules.length
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 上传设备模板
-app.post('/api/v1/devices/upload', upload.single('file'), (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: '未上传文件' });
-    }
-
-    const { deviceId, brand, model, description } = req.body;
-    const filename = req.file.originalname;
-
-    // 保存模板文件
-    const templatePath = path.join(TEMPLATES_DIR, filename);
-    fs.writeFileSync(templatePath, req.file.buffer);
-
-    // 更新索引
-    const indexPath = path.join(TEMPLATES_DIR, 'template_index.json');
-    let indexData = { devices: [] };
-    if (fs.existsSync(indexPath)) {
-      indexData = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    }
-
-    const existingIndex = indexData.devices.findIndex(d => d.id === deviceId);
-    const deviceInfo = {
-      id: deviceId || filename.replace(/\.xlsx?$/i, ''),
-      brand: brand || 'Unknown',
-      model: model || filename.replace(/\.xlsx?$/i, ''),
-      template: filename,
-      description: description || `${brand} ${model}`
-    };
-
-    if (existingIndex >= 0) {
-      indexData.devices[existingIndex] = deviceInfo;
-    } else {
-      indexData.devices.push(deviceInfo);
-    }
-
-    fs.writeFileSync(indexPath, JSON.stringify(indexData, null, 2));
-
-    res.json({ success: true, device: deviceInfo });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ============ 文件索引管理 ============
-
-// 构建/更新文件索引
 app.post('/api/v1/index/build', async (req, res) => {
   try {
     const { diskRoot } = req.body;
@@ -1262,108 +1189,9 @@ app.get('/api/v1/index/status/:diskRoot', (req, res) => {
 
 // ============ 采集任务 ============
 
-// SSE 实时扫描进度推送
-let scanStreamClients = [];
+// ============ Agent 运行过程 SSE ============
 
 const waitForFlush = () => new Promise(resolve => setImmediate(resolve));
-const AI_AUTOFILL_ITEM_TIMEOUT = Number(process.env.AI_AUTOFILL_ITEM_TIMEOUT || 60000);
-const AI_AUTOFILL_MAX_TOKENS = Number(process.env.AI_AUTOFILL_MAX_TOKENS || 1600);
-const COLLECTION_L2_MAX_FILES = Number(process.env.COLLECTION_L2_MAX_FILES || 15000);
-const COLLECTION_L3_MAX_FILES = Number(process.env.COLLECTION_L3_MAX_FILES || 5000);
-const COLLECTION_PROGRESS_EVERY = Number(process.env.COLLECTION_PROGRESS_EVERY || 200);
-
-function normalizeDiskRoot(diskRoot) {
-  const value = String(diskRoot || '').trim();
-  if (/^[a-z]:$/i.test(value)) return value + '\\';
-  return value;
-}
-
-app.get('/api/v1/scan-stream', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('X-Accel-Buffering', 'no'); // 禁用 Nginx 缓冲
-
-  // 禁用响应缓冲
-  res.socket.setNoDelay(true);
-
-  // 添加到客户端列表
-  scanStreamClients.push(res);
-
-  // 发送初始消息
-  const initMsg = 'data: {"type":"init","message":"扫描服务已连接"}\n\n';
-  res.write(initMsg);
-  if (res.flush) res.flush();
-
-  // 客户端断开时移除
-  req.on('close', () => {
-    scanStreamClients = scanStreamClients.filter(client => client !== res);
-    console.log('[SSE] 客户端断开连接');
-  });
-});
-
-// 推送扫描进度到所有客户端
-function pushScanProgress(data) {
-  const message = `data: ${JSON.stringify(data)}\n\n`;
-  scanStreamClients.forEach(client => {
-    try {
-      client.write(message);
-      if (client.flush) client.flush();
-    } catch (err) {
-      console.error('[SSE] 推送失败:', err.message);
-    }
-  });
-}
-
-async function pushScanProgressNow(data) {
-  pushScanProgress(data);
-  await waitForFlush();
-}
-
-// ============ AI 思考过程 SSE ============
-
-let aiThinkingClients = [];
-
-app.get('/api/v1/ai-thinking-stream', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('X-Accel-Buffering', 'no');
-
-  res.socket.setNoDelay(true);
-
-  aiThinkingClients.push(res);
-
-  const initMsg = 'data: {"type":"init","message":"AI 思考服务已连接"}\n\n';
-  res.write(initMsg);
-  if (res.flush) res.flush();
-
-  req.on('close', () => {
-    aiThinkingClients = aiThinkingClients.filter(client => client !== res);
-    console.log('[AI SSE] 客户端断开连接');
-  });
-});
-
-function pushAiThinking(data) {
-  const message = `data: ${JSON.stringify(data)}\n\n`;
-  aiThinkingClients.forEach(client => {
-    try {
-      client.write(message);
-      if (client.flush) client.flush();
-    } catch (err) {
-      console.error('[AI SSE] 推送失败:', err.message);
-    }
-  });
-}
-
-async function pushAiThinkingNow(data) {
-  pushAiThinking(data);
-  await waitForFlush();
-}
-
-// ============ Agent 运行过程 SSE ============
 
 let agentStreamClients = [];
 
@@ -1403,273 +1231,6 @@ async function pushAgentEventNow(data) {
   await waitForFlush();
 }
 
-// 执行完整的采集任务（v2: 三级匹配 + 可信度）
-app.post('/api/v1/collect', async (req, res) => {
-  const requestController = new AbortController();
-  req.on('aborted', () => requestController.abort());
-  res.on('close', () => {
-    if (!res.writableEnded) requestController.abort();
-  });
-
-  try {
-    const { diskRoot, diskRoots, rules, useIndex = true } = req.body;
-    const targetDisks = (Array.isArray(diskRoots) && diskRoots.length > 0 ? diskRoots : [diskRoot])
-      .map(disk => normalizeDiskRoot(disk))
-      .filter(Boolean);
-
-    if (targetDisks.length === 0 || !rules || !Array.isArray(rules)) {
-      return res.status(400).json({ success: false, error: '缺少必要参数: diskRoot/diskRoots, rules' });
-    }
-
-    const startTime = Date.now();
-    const allMatchedFiles = new Set();
-    const results = [];
-    const usedIndex = false;
-    let fallbackUsed = false;
-    let stopped = false;
-
-    // 推送开始消息
-    await pushScanProgressNow({ type: 'start', totalRules: rules.length, totalDisks: targetDisks.length });
-
-    for (const currentDisk of targetDisks) {
-      if (requestController.signal.aborted) {
-        stopped = true;
-        break;
-      }
-
-      await pushScanProgressNow({ type: 'disk_start', diskRoot: currentDisk });
-
-      for (const rule of rules) {
-        if (requestController.signal.aborted) {
-          stopped = true;
-          break;
-        }
-
-        const filePattern = rule.filePattern || rule.file_pattern || '';
-
-        await pushScanProgressNow({
-          type: 'rule_start',
-          diskRoot: currentDisk,
-          indicator: rule.indicator,
-          filePattern
-        });
-
-        const levelResults = await collectRuleByLevels(currentDisk, rule, requestController.signal, allMatchedFiles);
-        if (levelResults.stopped) {
-          stopped = true;
-          break;
-        }
-        if (levelResults.fallbackUsed) fallbackUsed = true;
-        results.push(...levelResults.results);
-      }
-    }
-
-    // 推送扫描完成
-    await pushScanProgressNow({
-      type: stopped ? 'scan_stopped' : 'scan_complete',
-      totalFiles: allMatchedFiles.size
-    });
-
-    // 第二步：三级匹配提取参数
-    const successCount = results.filter(r => r.success).length;
-    const failCount = results.filter(r => !r.success).length;
-
-    const scanLog = {
-      scan_time: new Date().toISOString(),
-      disk: targetDisks.join(', '),
-      disks: targetDisks,
-      total_files: allMatchedFiles.size,
-      success_count: successCount,
-      fail_count: failCount,
-      total_indicators: rules.length * targetDisks.length,
-      duration: ((Date.now() - startTime) / 1000).toFixed(2),
-      template_rules: rules.length,
-      used_index: usedIndex,
-      fallback_scan: fallbackUsed,
-      stopped
-    };
-
-    // 第三步：生成结果 Excel
-    const outputPath = path.join(TEMP_DIR, 'Collection_Result.xlsx');
-    generateResultExcel(results, scanLog, outputPath);
-
-    res.json({
-      success: true,
-      results,
-      scanLog,
-      outputFile: outputPath
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-async function collectRuleByLevels(diskRoot, rule, signal, allMatchedFiles) {
-  const levels = [
-    {
-      level: 'L1',
-      name: 'L1 参考路径',
-      fallbackUsed: false,
-      scan: async onProgress => {
-        const filePattern = rule.filePattern || rule.file_pattern || '';
-        if (!filePattern || !filePattern.trim()) return [];
-        return scanReferenceFilesWithProgress(diskRoot, filePattern, onProgress, {
-          signal,
-          progressEvery: COLLECTION_PROGRESS_EVERY
-        });
-      }
-    },
-    {
-      level: 'L2',
-      name: 'L2 文件扩展',
-      fallbackUsed: false,
-      scan: async onProgress => scanFileGlobsWithProgress(diskRoot, buildFileGlobCandidates(rule), onProgress, {
-        signal,
-        maxFiles: COLLECTION_L2_MAX_FILES,
-        progressEvery: COLLECTION_PROGRESS_EVERY
-      })
-    },
-    {
-      level: 'L3',
-      name: 'L3 全盘兜底',
-      fallbackUsed: true,
-      scan: async onProgress => scanAllLogFilesWithProgressOptions(diskRoot, onProgress, {
-        signal,
-        maxFiles: COLLECTION_L3_MAX_FILES,
-        progressEvery: COLLECTION_PROGRESS_EVERY
-      })
-    }
-  ];
-
-  let finalResults = [];
-  let usedFallback = false;
-
-  for (const levelInfo of levels) {
-    if (signal.aborted) return { results: finalResults, fallbackUsed: usedFallback, stopped: true };
-
-    await pushScanProgressNow({
-      type: 'scan_level_start',
-      diskRoot,
-      indicator: rule.indicator,
-      level: levelInfo.level,
-      levelName: levelInfo.name
-    });
-
-    const files = await levelInfo.scan(async progress => {
-      await pushScanProgressNow({
-        type: progress.type,
-        diskRoot,
-        indicator: rule.indicator,
-        level: levelInfo.level,
-        levelName: levelInfo.name,
-        dir: progress.dir,
-        file: progress.file,
-        checkedFiles: progress.checkedFiles,
-        matchedFiles: progress.matchedFiles,
-        target: progress.target
-      });
-    });
-
-    const uniqueFiles = [...new Set(files)];
-    uniqueFiles.forEach(file => allMatchedFiles.add(file));
-
-    await pushScanProgressNow({
-      type: 'rule_candidates',
-      diskRoot,
-      indicator: rule.indicator,
-      level: levelInfo.level,
-      levelName: levelInfo.name,
-      filesFound: uniqueFiles.length
-    });
-
-    const levelResults = await extractRuleFromFiles(diskRoot, rule, uniqueFiles, levelInfo, signal);
-    finalResults = levelResults;
-    if (levelInfo.fallbackUsed) usedFallback = true;
-
-    const hit = levelResults.some(result => result.success);
-    await pushScanProgressNow({
-      type: 'scan_level_complete',
-      diskRoot,
-      indicator: rule.indicator,
-      level: levelInfo.level,
-      levelName: levelInfo.name,
-      filesFound: uniqueFiles.length,
-      hit
-    });
-
-    if (signal.aborted) return { results: finalResults, fallbackUsed: usedFallback, stopped: true };
-    if (hit) return { results: finalResults, fallbackUsed: usedFallback, stopped: false };
-  }
-
-  return { results: finalResults, fallbackUsed: usedFallback, stopped: false };
-}
-
-async function extractRuleFromFiles(diskRoot, rule, files, levelInfo, signal) {
-  const keyword = rule.keyword || rule.indicator || '';
-  const synonyms = Array.isArray(rule.synonyms) ? [...rule.synonyms] : [];
-
-  if (!keyword && rule.indicator) {
-    synonyms.push(rule.indicator);
-  }
-
-  await pushScanProgressNow({
-    type: 'extract_start',
-    diskRoot,
-    indicator: rule.indicator,
-    level: levelInfo.level,
-    levelName: levelInfo.name,
-    filesFound: files.length
-  });
-
-  const task = {
-    indicator: rule.indicator,
-    keyword,
-    synonyms,
-    dataType: rule.dataType || '',
-    unit: rule.unit || '',
-    files,
-    file_pattern: rule.filePattern || rule.file_pattern || '',
-    keywordMeaning: rule.keywordMeaning || rule.keyword_meaning || ''
-  };
-
-  return (await batchExtractWithProgress([task], async progress => {
-    await pushScanProgressNow({
-      type: progress.type,
-      diskRoot,
-      indicator: progress.indicator,
-      keyword: progress.keyword,
-      file: progress.file,
-      lineNumber: progress.lineNumber,
-      line: progress.line,
-      matchedWord: progress.matchedWord,
-      checkedFiles: progress.checkedFiles,
-      matchedFiles: progress.matchedFiles,
-      level: levelInfo.level,
-      levelName: levelInfo.name
-    });
-  }, { signal })).map(result => ({
-    ...result,
-    disk_root: diskRoot,
-    scan_level: levelInfo.level,
-    scan_strategy: levelInfo.name
-  }));
-}
-
-// 从单个文件中提取参数（三级匹配）
-app.post('/api/v1/extract', (req, res) => {
-  try {
-    const { filePath, keyword, synonyms } = req.body;
-    if (!filePath || !keyword) {
-      return res.status(400).json({ success: false, error: '缺少必要参数: filePath, keyword' });
-    }
-
-    const result = extractParameter(filePath, keyword, synonyms || []);
-    res.json({ success: result.success, ...result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
 // 下载结果文件
 app.get('/api/v1/result/download', (req, res) => {
   const filePath = path.join(TEMP_DIR, 'Collection_Result.xlsx');
@@ -1679,388 +1240,9 @@ app.get('/api/v1/result/download', (req, res) => {
   res.download(filePath, '设备参数采集结果.xlsx');
 });
 
-// ==================== AI 功能 API ====================
-
-// 获取 AI 服务状态
-app.get('/api/v1/ai/status', async (req, res) => {
-  res.json({
-    success: true,
-    backends: getAvailableBackends(),
-    agentConfig: publicAgentConfig(agentRuntimeConfig),
-    api: { available: !!agentRuntimeConfig.apiKey, local: false }
-  });
-});
-
-// AI 参数匹配
-app.post('/api/v1/ai/match', async (req, res) => {
-  try {
-    const { indicator, keyword, synonyms, filePath, fileContent, dataType, unit } = req.body;
-
-    if (!indicator || !keyword) {
-      return res.status(400).json({ success: false, error: '缺少必要参数: indicator, keyword' });
-    }
-
-    // 如果没有提供文件内容，尝试读取文件
-    let content = fileContent;
-    if (!content && filePath) {
-      try {
-        content = fs.readFileSync(filePath, 'utf-8');
-      } catch {
-        return res.status(400).json({ success: false, error: '无法读取文件内容' });
-      }
-    }
-
-    if (!content) {
-      return res.status(400).json({ success: false, error: '需要提供 fileContent 或有效的 filePath' });
-    }
-
-    const rule = { indicator, keyword, synonyms: synonyms || [], dataType, unit };
-    const result = await aiMatchParameter(rule, filePath || 'unknown', content);
-
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// AI 智能补全（根据指标名称生成关键词和文件路径）
-app.post('/api/v1/ai/autofill', async (req, res) => {
-  const requestController = new AbortController();
-  req.on('aborted', () => requestController.abort());
-  res.on('close', () => {
-    if (!res.writableEnded) requestController.abort();
-  });
-
-  try {
-    const { indicators, vendor, deviceType, model, backend, provider, baseUrl, apiKey } = req.body;
-
-    if (!indicators || !Array.isArray(indicators) || indicators.length === 0) {
-      return res.status(400).json({ success: false, error: '缺少必要参数: indicators' });
-    }
-
-    // 推送开始思考
-    await pushAiThinkingNow({
-      type: 'start',
-      message: `开始分析 ${indicators.length} 个指标`,
-      vendor: vendor || '医疗',
-      deviceType: deviceType || '设备'
-    });
-
-    const rules = [];
-    const failures = [];
-    for (let i = 0; i < indicators.length; i++) {
-      if (requestController.signal.aborted) break;
-      const indicator = indicators[i];
-
-      // 推送正在分析指标
-      await pushAiThinkingNow({
-        type: 'analyzing',
-        indicator: indicator,
-        index: i + 1,
-        total: indicators.length,
-        progress: `${i + 1}/${indicators.length}`
-      });
-
-      const prompt = `你是${vendor || '医疗'}${deviceType || '设备'}日志分析专家。
-请为以下指标生成采集关键词。
-
-指标名称：${indicator}
-
-重要限制：
-- 日志中不会出现中文，keyword 和 synonyms 必须全部使用英文或 ASCII 字段名。
-- 不要把中文解释、中文翻译、中文词语放进 keyword 或 synonyms。
-- filePattern 只能使用英文目录名、英文文件名或常见路径片段。
-
-请先输出可展示分析过程，最多 3 行，每行以“分析：”开头，说明你如何判断英文参考日志路径、英文主关键词和英文备用关键词。
-最后单独输出一段 JSON，格式如下：
-{
-  "filePattern": "English path fragment, e.g. MedCom/log, MriSiteData, SysUtil",
-  "keyword": "EnglishFieldName",
-  "synonyms": ["EnglishAlias1", "english_alias_2", "EnglishAlias3"],
-  "keywordMeaning": "中文说明：该关键字在日志中通常表示什么，必要时写出关键字段与含义"
-}
-
-如果不确定，filePattern填""，keyword填""，synonyms填[]。`;
-
-      await pushAiThinkingNow({
-        type: 'thinking',
-        indicator,
-        message: `正在接收 AI 输出...`
-      });
-
-      let parsed = null;
-      let rawContent = '';
-      try {
-        const aiResult = await callAIStream(
-          prompt,
-          {
-            ...mergeAgentAIOptions({
-              backend,
-              provider,
-              baseUrl,
-              apiKey,
-              model: model || undefined
-            }),
-            timeout: AI_AUTOFILL_ITEM_TIMEOUT,
-            maxTokens: AI_AUTOFILL_MAX_TOKENS,
-            formatJson: false,
-            signal: requestController.signal
-          },
-          token => {
-            rawContent += token;
-            pushAiThinking({
-              type: 'delta',
-              indicator,
-              content: token
-            });
-          }
-        );
-
-        rawContent = aiResult.content || rawContent;
-        const jsonMatch = aiResult.content.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          parsed = JSON.parse(jsonMatch[0]);
-          parsed = sanitizeAiAutofillRule(parsed);
-          // 推送解析成功
-          await pushAiThinkingNow({
-            type: 'success',
-            indicator: indicator,
-            keyword: parsed?.keyword || '',
-            synonyms: parsed?.synonyms || [],
-            filePattern: parsed?.filePattern || '',
-            keywordMeaning: parsed?.keywordMeaning || '',
-            summary: summarizeAiOutput(rawContent)
-          });
-        } else {
-          console.log('AI 返回内容:', aiResult.content);
-          failures.push({ indicator, error: 'AI 返回格式异常' });
-          await pushAiThinkingNow({
-            type: 'warning',
-            indicator: indicator,
-            message: 'AI 返回格式异常，已跳过该指标',
-            summary: summarizeAiOutput(rawContent)
-          });
-        }
-      } catch (e) {
-        // AI 返回解析失败，记录日志
-        console.error('AI 返回解析失败:', e.message);
-        console.error('AI 原始响应:', rawContent?.substring(0, 500));
-        failures.push({ indicator, error: e.message });
-        await pushAiThinkingNow({
-          type: 'error',
-          indicator: indicator,
-          message: `该指标失败，已继续下一项：${e.message}`,
-          summary: summarizeAiOutput(rawContent)
-        });
-      }
-
-      rules.push({
-        indicator,
-        filePattern: parsed?.filePattern || '',
-        keyword: parsed?.keyword || '',
-        synonyms: parsed?.synonyms || [],
-        keywordMeaning: parsed?.keywordMeaning || ''
-      });
-    }
-
-    // 推送完成
-    await pushAiThinkingNow({
-      type: 'complete',
-      message: `补全完成：成功 ${rules.length - failures.length}，失败 ${failures.length}`,
-      successCount: rules.length - failures.length,
-      failCount: failures.length,
-      total: rules.length
-    });
-
-    res.json({ success: true, rules, failures });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-function summarizeAiOutput(content = '') {
-  const lines = String(content)
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(Boolean)
-    .filter(line => !line.startsWith('{') && !line.startsWith('"') && !line.startsWith('}'))
-    .map(line => line.replace(/^分析[:：]\s*/, ''))
-    .slice(0, 3);
-  return lines.join('\n');
-}
-
-function sanitizeAiAutofillRule(rule = {}) {
-  return {
-    filePattern: sanitizeFilePattern(rule.filePattern || rule.file_pattern || ''),
-    keyword: sanitizeKeyword(rule.keyword || ''),
-    synonyms: sanitizeSynonyms(rule.synonyms || []),
-    keywordMeaning: String(rule.keywordMeaning || rule.keyword_meaning || '').trim()
-  };
-}
-
-function sanitizeFilePattern(value) {
-  return String(value || '')
-    .split(',')
-    .map(part => part.trim())
-    .filter(part => part && /^[A-Za-z0-9_./\\*?\-\s]+$/.test(part))
-    .join(', ');
-}
-
-function sanitizeKeyword(value) {
-  const text = String(value || '').trim();
-  if (!text || /[^\x00-\x7F]/.test(text)) return '';
-  return text.replace(/[^A-Za-z0-9_.:\-\s]/g, '').trim();
-}
-
-function sanitizeSynonyms(value) {
-  const list = Array.isArray(value) ? value : String(value || '').split(/[;,；，]/);
-  return [...new Set(list.map(sanitizeKeyword).filter(Boolean))].slice(0, 8);
-}
-
-// AI 未知参数发现
-app.post('/api/v1/ai/discover', async (req, res) => {
-  try {
-    const { diskRoot, existingIndicators } = req.body;
-
-    if (!diskRoot) {
-      return res.status(400).json({ success: false, error: '缺少必要参数: diskRoot' });
-    }
-
-    // 扫描日志文件
-    const files = scanLogFiles(diskRoot);
-
-    if (files.length === 0) {
-      return res.json({
-        success: true,
-        suggestions: [],
-        message: '未找到日志文件'
-      });
-    }
-
-    // 限制文件数量和大小
-    const limitedFiles = files
-      .slice(0, 30)
-      .map(f => ({
-        path: f.path,
-        content: f.content.length > 10000 ? f.content.substring(0, 10000) : f.content
-      }));
-
-    const result = await discoverUnknownParameters(limitedFiles, existingIndicators || []);
-
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// AI 生成模板
-app.post('/api/v1/ai/generate-template', async (req, res) => {
-  try {
-    const { userRequest, diskRoot } = req.body;
-
-    if (!userRequest) {
-      return res.status(400).json({ success: false, error: '缺少必要参数: userRequest' });
-    }
-
-    // 提取可用字段
-    let availableFields = [];
-    if (diskRoot) {
-      try {
-        availableFields = await extractAvailableFields(diskRoot);
-      } catch {
-        // 字段提取失败，继续生成
-      }
-    }
-
-    const result = await generateTemplate(userRequest, availableFields);
-
-    if (result.success) {
-      // 保存模板到文件
-      const templatePath = path.join(TEMPLATES_DIR, `ai_${Date.now()}.xlsx`);
-      await saveTemplateToExcel(result.template, templatePath);
-      result.templatePath = templatePath;
-    }
-
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ==================== AI 智能补全 ====================
-app.post('/api/v1/ai/smart-fill', async (req, res) => {
-  try {
-    const { indicators, vendor, deviceType, model } = req.body;
-    if (!indicators || !Array.isArray(indicators) || indicators.length === 0) {
-      return res.json({ success: false, error: '请提供指标名称列表' });
-    }
-
-    // 1. 先尝试从经验库匹配
-    const matchResult = findMatchingRecords(vendor, deviceType);
-    const matchedRecords = matchResult.exact.length > 0 ? matchResult.exact : matchResult.vendor;
-    const filledRules = [];
-
-    for (const indicator of indicators) {
-      let rule = { indicator, filePattern: '', keyword: '', synonyms: '' };
-
-      // 尝试从经验库匹配
-      if (matchedRecords.length > 0) {
-        for (const record of matchedRecords) {
-          const matchedRule = record.rules.find(r =>
-            r.indicator && r.indicator.toLowerCase().includes(indicator.toLowerCase()) ||
-            indicator.toLowerCase().includes(r.indicator.toLowerCase())
-          );
-          if (matchedRule) {
-            rule = {
-              indicator,
-              filePattern: matchedRule.filePattern || '',
-              keyword: matchedRule.keyword || '',
-              synonyms: matchedRule.synonyms || '',
-              keywordMeaning: matchedRule.keywordMeaning || matchedRule.keyword_meaning || ''
-            };
-            rule._fromExperience = true;
-            break;
-          }
-        }
-      }
-
-      // 如果经验库没有匹配，使用 AI 生成
-      if (!rule._fromExperience) {
-        const aiResult = await aiSmartFill(indicator, vendor, deviceType);
-        if (aiResult && aiResult.success) {
-          rule = {
-              indicator,
-              filePattern: aiResult.filePattern || '',
-              keyword: aiResult.keyword || '',
-              synonyms: aiResult.synonyms || '',
-              keywordMeaning: aiResult.keywordMeaning || aiResult.keyword_meaning || ''
-            };
-        }
-      }
-
-      filledRules.push(rule);
-    }
-
-    res.json({ success: true, rules: filledRules, experienceCount: matchedRecords.length });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
 // ==================== 采集经验库 API ====================
 
 // 获取经验库列表
-app.get('/api/v1/experience', (req, res) => {
-  try {
-    const { vendor, deviceType } = req.query;
-    const records = getAllRecords(vendor, deviceType);
-    res.json({ success: true, records });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 获取经验库列表（别名）
 app.get('/api/v1/experience/list', (req, res) => {
   try {
     const records = getAllRecords();
@@ -2071,20 +1253,6 @@ app.get('/api/v1/experience/list', (req, res) => {
 });
 
 // 按厂商和设备类型匹配经验（静态路由，必须在 :id 之前）
-app.get('/api/v1/experience/match', (req, res) => {
-  try {
-    const { vendor, deviceType } = req.query;
-    if (!vendor || !deviceType) {
-      return res.json({ success: false, error: '缺少 vendor 或 deviceType 参数' });
-    }
-    const records = findMatchingRecords(vendor, deviceType);
-    res.json({ success: true, records });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 获取单条经验详情
 app.get('/api/v1/experience/:id', (req, res) => {
   try {
     const record = getRecordDetail(req.params.id);
@@ -2098,8 +1266,9 @@ app.get('/api/v1/experience/:id', (req, res) => {
 });
 
 // 保存采集经验
-app.post('/api/v1/experience', (req, res) => {
+app.post('/api/v1/experience/save', async (req, res) => {
   try {
+    await agentStoreReady;
     const { vendor, deviceType, model, rules, successRate } = req.body;
     if (!vendor || !deviceType || !rules || !Array.isArray(rules)) {
       return res.json({ success: false, error: '缺少必要参数' });
@@ -2112,77 +1281,15 @@ app.post('/api/v1/experience', (req, res) => {
       rules,
       successRate: successRate || 0
     });
+    const knowledge = persistCollectionKnowledge(record.id, req.body);
 
-    res.json({ success: true, record });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 保存采集经验（别名）
-app.post('/api/v1/experience/save', (req, res) => {
-  try {
-    const { vendor, deviceType, model, rules, successRate } = req.body;
-    if (!vendor || !deviceType || !rules || !Array.isArray(rules)) {
-      return res.json({ success: false, error: '缺少必要参数' });
-    }
-
-    const record = saveCollectionRecord({
-      vendor,
-      deviceType,
-      model: model || '',
-      rules,
-      successRate: successRate || 0
-    });
-
-    res.json({ success: true, record });
+    res.json({ success: true, record, knowledge: { verified: knowledge.verified, pending: knowledge.pending, failed: knowledge.failed, generated: knowledge.candidates.length } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
 // 按厂商和设备类型匹配经验（POST方式，支持指标匹配）
-app.post('/api/v1/experience/match', (req, res) => {
-  try {
-    const { vendor, deviceType, indicators } = req.body;
-    if (!vendor || !deviceType) {
-      return res.json({ success: false, error: '缺少 vendor 或 deviceType 参数' });
-    }
-    const matchResult = findMatchingRecords(vendor, deviceType);
-    const matchedRecords = matchResult.exact.length > 0 ? matchResult.exact : matchResult.vendor;
-
-    // 如果提供了指标列表，返回匹配的规则
-    if (indicators && Array.isArray(indicators) && indicators.length > 0) {
-      const matches = [];
-      for (const indicator of indicators) {
-        for (const record of matchedRecords) {
-          if (!record.rules) continue;
-          const matchedRule = record.rules.find(r =>
-            (r.indicator && r.indicator.toLowerCase().includes(indicator.toLowerCase())) ||
-            (indicator.toLowerCase().includes((r.indicator || '').toLowerCase()))
-          );
-          if (matchedRule) {
-            matches.push({
-              indicator: indicator,
-              filePattern: matchedRule.filePattern || '',
-              keyword: matchedRule.keyword || '',
-              synonyms: matchedRule.synonyms || '',
-              keywordMeaning: matchedRule.keywordMeaning || matchedRule.keyword_meaning || ''
-            });
-            break;
-          }
-        }
-      }
-      return res.json({ success: true, matches, experienceCount: matchedRecords.length });
-    }
-
-    res.json({ success: true, records: matchResult });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 更新采集经验
 app.put('/api/v1/experience/:id', (req, res) => {
   try {
     const { vendor, deviceType, model, rules, successRate } = req.body;
@@ -2207,6 +1314,7 @@ app.put('/api/v1/experience/:id', (req, res) => {
 // 删除采集经验
 app.delete('/api/v1/experience/:id', (req, res) => {
   try {
+    clearKnowledgeCandidates({ sourceRecordId: req.params.id });
     const deleted = deleteRecord(req.params.id);
     if (!deleted) {
       return res.json({ success: false, error: '记录不存在' });
@@ -2223,7 +1331,29 @@ app.get('*', (req, res) => {
 });
 
 // 启动服务
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, '0.0.0.0', () => {
   console.log(`大放设备参数采集程序 v4.0 已启动: http://localhost:${PORT}`);
   console.log(`平台: ${process.platform}`);
+  if (typeof process.send === 'function') process.send({ type: 'server-ready', port: Number(PORT) });
+});
+
+httpServer.on('error', (error) => {
+  console.error('[server]', error.message);
+  process.exit(1);
+});
+
+let shuttingDown = false;
+function shutdownServer(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try { closeAgentSession(RUNTIME_SESSION_ID); } catch {}
+  console.log(`收到 ${signal}，正在关闭服务...`);
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+
+process.on('SIGTERM', () => shutdownServer('SIGTERM'));
+process.on('SIGINT', () => shutdownServer('SIGINT'));
+process.parentPort?.on('message', event => {
+  if (event?.data?.type === 'shutdown') shutdownServer('APP_CLOSE');
 });

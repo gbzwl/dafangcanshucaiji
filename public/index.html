@@ -200,6 +200,12 @@
           <input id="agentOutputMode" type="hidden" value="auto">
           <div class="agent-api-grid">
             <label class="agent-api-field">
+              <span>历史配置</span>
+              <select id="agentProfileSelect" class="agent-api-input">
+                <option value="">新配置</option>
+              </select>
+            </label>
+            <label class="agent-api-field">
               <span>Base URL</span>
               <input id="agentBaseUrl" class="agent-api-input" type="text" placeholder="https://api.deepseek.com">
             </label>
@@ -209,11 +215,12 @@
             </label>
             <label class="agent-api-field">
               <span>API Key</span>
-              <input id="agentApiKey" class="agent-api-input" type="password" placeholder="仅当前会话使用">
+              <input id="agentApiKey" class="agent-api-input" type="password" placeholder="输入后由服务器加密保存">
             </label>
           </div>
           <div class="agent-api-actions">
             <button id="btnAgentTest" class="btn btn-sm btn-secondary">测试连接</button>
+            <button id="btnDeleteAgentProfile" class="btn btn-sm btn-secondary" disabled>删除配置</button>
             <span id="agentApiStatus" class="scan-status-text">未配置</span>
           </div>
         </div>
@@ -247,24 +254,6 @@
 
         <details class="agent-settings-panel">
           <summary>Agent 设置</summary>
-          <div class="agent-settings-grid">
-            <label>
-              <span>最大步骤数</span>
-              <input id="agentMaxSteps" type="number" min="1" max="30" value="10">
-            </label>
-            <label>
-              <span>最长时间(秒)</span>
-              <input id="agentMaxDuration" type="number" min="10" max="1800" value="300">
-            </label>
-            <label>
-              <span>候选知识数</span>
-              <input id="agentMaxCandidates" type="number" min="0" max="30" value="8">
-            </label>
-            <label>
-              <span>工具结果上限</span>
-              <input id="agentMaxResultChars" type="number" min="1000" max="30000" value="7000">
-            </label>
-          </div>
           <div class="agent-profile-editor">
             <label for="agentProfileInput">Agent 个性化设定</label>
             <textarea id="agentProfileInput" rows="9"></textarea>
@@ -349,16 +338,20 @@
               <tr>
                 <th width="30">#</th>
                 <th>指标</th>
+                <th>指标标识</th>
                 <th>采集值</th>
                 <th>文件路径</th>
                 <th>匹配关键字</th>
+                <th>备用关键字</th>
                 <th>关键字和含义</th>
                 <th>证据内容</th>
                 <th>数据时间</th>
                 <th>文件修改时间</th>
                 <th>证据等级</th>
                 <th>置信度</th>
+                <th>匹配方式</th>
                 <th>状态</th>
+                <th>来源</th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -484,38 +477,6 @@
           <button class="btn btn-secondary" id="btnDownloadRawExperienceTemplate">下载旧表模板</button>
           <button class="btn btn-secondary" onclick="closeImportRawExperienceModal()">取消</button>
           <button class="btn btn-primary" id="btnConfirmImportRawExperience">选择并导入</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 编辑记录弹窗 -->
-    <div class="modal-overlay" id="editExpModal" style="display:none;">
-      <div class="modal modal-large">
-        <div class="modal-header">
-          <h3>✏️ 编辑采集记录</h3>
-          <button class="modal-close" onclick="closeEditModal()">✕</button>
-        </div>
-        <div class="modal-body">
-          <div class="save-form">
-            <div class="form-group">
-              <label>厂商</label>
-              <input type="text" id="editVendor">
-            </div>
-            <div class="form-group">
-              <label>设备类型</label>
-              <input type="text" id="editDeviceType">
-            </div>
-            <div class="form-group">
-              <label>设备型号</label>
-              <input type="text" id="editModel">
-            </div>
-          </div>
-          <h4 style="margin:16px 0 8px;">采集规则</h4>
-          <div class="exp-rules-table" id="editRulesTable"></div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" onclick="closeEditModal()">取消</button>
-          <button class="btn btn-primary" id="btnConfirmEdit">💾 保存修改</button>
         </div>
       </div>
     </div>

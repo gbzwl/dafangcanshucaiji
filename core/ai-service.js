@@ -1,4 +1,4 @@
-const DEFAULT_TIMEOUT = 120000;
+const DEFAULT_TIMEOUT = 5 * 60 * 1000;
 
 export async function callAI(prompt, options = {}) {
   const runtime = resolveRuntimeConfig(options);
@@ -141,9 +141,12 @@ function resolveRuntimeConfig(options = {}) {
 }
 
 function buildRequest(prompt, runtime, options, stream) {
+  const messages = Array.isArray(options.messages) && options.messages.length
+    ? options.messages
+    : [{ role: 'user', content: prompt }];
   return {
     model: runtime.model,
-    messages: [{ role: 'user', content: prompt }],
+    messages,
     temperature: options.temperature ?? 0.2,
     max_tokens: options.maxTokens ?? 2048,
     stream,

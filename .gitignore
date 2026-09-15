@@ -6,6 +6,7 @@ pnpm-lock.yaml
 *.db
 *.sqlite
 *.sqlite3
+.agent-config.key
 experience.db
 index.db
 

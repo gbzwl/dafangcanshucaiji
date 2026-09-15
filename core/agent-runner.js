@@ -8,14 +8,13 @@ import {
   createAgentTask,
   recordGeneratedToolRun,
   retrieveAgentMemories,
-  saveAgentMemory,
   saveGeneratedTool,
   updateAgentTask
 } from './agent-store.js';
 
-const DEFAULT_MAX_STEPS = 12;
-const DEFAULT_MAX_CANDIDATES = 12;
-const DEFAULT_MAX_RESULT_CHARS = 12000;
+const DEFAULT_MAX_STEPS = 24;
+const DEFAULT_MAX_CANDIDATES = 16;
+const DEFAULT_MAX_RESULT_CHARS = 20000;
 const DEFAULT_MAX_TOKEN_OUTPUT = 5000;
 
 export async function runAgentCollection(request = {}, hooks = {}) {
@@ -31,15 +30,13 @@ export async function runAgentCollection(request = {}, hooks = {}) {
     model: String(request.model || '').trim(),
     roots,
     aiOptions: request.aiOptions || {},
-    maxSteps: clampNumber(request.maxSteps, 1, 40, DEFAULT_MAX_STEPS),
-    maxCandidates: clampNumber(request.maxCandidates, 1, 50, DEFAULT_MAX_CANDIDATES),
-    maxResultChars: clampNumber(request.maxResultChars, 2000, 50000, DEFAULT_MAX_RESULT_CHARS),
-    maxDurationMs: clampNumber(request.maxDurationMs, 30000, 2 * 60 * 60 * 1000, 20 * 60 * 1000),
+    maxSteps: DEFAULT_MAX_STEPS,
+    maxCandidates: DEFAULT_MAX_CANDIDATES,
+    maxResultChars: DEFAULT_MAX_RESULT_CHARS,
     agentProfile: String(request.agentProfile || '').trim(),
     dryRun: !!request.dryRun,
     signal: request.aiOptions?.signal
   };
-  context.deadline = startedAt + context.maxDurationMs;
   context.taskId = safeCreateTask({ ...context, indicators });
 
   const results = [];
@@ -56,10 +53,6 @@ export async function runAgentCollection(request = {}, hooks = {}) {
 
     for (let index = 0; index < indicators.length; index++) {
       if (context.signal?.aborted) throw new Error('Agent 采集已停止');
-      if (Date.now() > context.deadline) {
-        results.push(...indicators.slice(index).map(item => emptyResult(item, 'failed', '任务达到最长执行时间')));
-        break;
-      }
 
       const indicator = indicators[index];
       safeUpdateTask(context.taskId, { currentIndicator: indicator.indicatorId, currentStep: 0 });
@@ -74,7 +67,6 @@ export async function runAgentCollection(request = {}, hooks = {}) {
 
       const result = await runIndicator(indicator, memory, context, hooks, trace, toolCalls, sharedDiscoveries);
       results.push(result);
-      rememberResult(result, indicator, context);
       await emit(hooks, trace, context, { type: 'indicator_complete', indicator: indicator.indicator, indicatorId: indicator.indicatorId, status: result.status, confidence: result.confidence });
     }
 
@@ -92,10 +84,10 @@ async function runIndicator(indicator, memory, context, hooks, trace, toolCalls,
   const observations = [];
   let lastModelText = '';
   let parseErrors = 0;
+  const actionCounts = new Map();
 
   for (let step = 1; step <= context.maxSteps; step++) {
     if (context.signal?.aborted) throw new Error('Agent 采集已停止');
-    if (Date.now() > context.deadline) return emptyResult(indicator, 'failed', '任务达到最长执行时间');
     safeUpdateTask(context.taskId, { currentIndicator: indicator.indicatorId, currentStep: step });
     await emit(hooks, trace, context, { type: 'model_step', indicator: indicator.indicator, indicatorId: indicator.indicatorId, step, maxSteps: context.maxSteps });
 
@@ -132,6 +124,14 @@ async function runIndicator(indicator, memory, context, hooks, trace, toolCalls,
 
     const toolName = String(action.name || action.tool || `explore_${indicator.indicatorId}_${step}`).trim();
     const sourceCode = String(action.code || '').trim();
+    const actionSignature = JSON.stringify({ code: sourceCode.replace(/\s+/g, ' ').trim(), args: action.args || {} });
+    const repeated = (actionCounts.get(actionSignature) || 0) + 1;
+    actionCounts.set(actionSignature, repeated);
+    if (repeated >= 3) {
+      observations.push({ type: 'stagnation', message: '相同工具和参数已重复执行，必须改变探索策略或给出当前结论' });
+      await emit(hooks, trace, context, { type: 'stagnation', indicator: indicator.indicator, indicatorId: indicator.indicatorId, step, message: '检测到重复探索，要求模型重新规划' });
+      continue;
+    }
     const savedTool = safeSaveTool({
       name: toolName,
       description: action.thought || action.description || '',
@@ -146,9 +146,18 @@ async function runIndicator(indicator, memory, context, hooks, trace, toolCalls,
     const startedAt = Date.now();
     const executed = await executeGeneratedTool({ code: sourceCode, args: action.args || {} }, {
       roots: context.roots,
-      timeoutMs: Math.min(120000, Math.max(10000, context.deadline - Date.now())),
+      idleTimeoutMs: 3 * 60 * 1000,
+      hardTimeoutMs: 15 * 60 * 1000,
       maxOutputChars: context.maxResultChars * 2,
-      signal: context.signal
+      signal: context.signal,
+      onProgress: progress => hooks.onEvent?.({
+        type: 'tool_progress',
+        indicator: indicator.indicator,
+        indicatorId: indicator.indicatorId,
+        step,
+        tool: toolName,
+        progress
+      })
     });
     const compact = compactResult(executed, context.maxResultChars);
     safeRecordToolRun(savedTool?.id, { success: executed.success !== false, durationMs: Date.now() - startedAt, error: executed.error || '' });
@@ -245,6 +254,7 @@ ${JSON.stringify(observations.slice(-8), null, 2)}
 - 已提供 fs、path、zlib、readline 和 context。
 - context.roots 是允许读取的根目录；context.args 是本次参数；context.limits 包含 maxFiles、maxReadBytes、maxResults。
 - 代码位于 async function generatedTool(context) 内，最后必须 return 可 JSON 序列化结果。
+- 扫描过程中每处理约 100 个文件或每 5 秒调用 context.reportProgress({ checkedFiles, currentPath, matches })，让程序确认工具仍在推进。
 - 允许使用 fs.promises、createReadStream、readdir、stat 和 readline，必须限制文件数、读取量和结果数。
 - 先探索高概率目录和文件名，再读取小片段；大日志优先读取尾部或逐行搜索。
 - 不要在代码中写死当前机器盘符，必须从 context.roots 开始。
@@ -257,12 +267,14 @@ ${JSON.stringify(observations.slice(-8), null, 2)}
     "value": "采集值",
     "filePath": "真实完整路径",
     "matchedKeyword": "实际字段或 selector",
+    "synonyms": ["本次验证过的备用关键字"],
     "keywordMeaning": "中文含义和判断说明",
     "evidence": "来自文件的原始证据片段",
     "dataTimestamp": "数据时间，无法确定则为空",
     "fileMtime": "文件修改时间",
     "evidenceLevel": "STRONG|MEDIUM|WEAK|NONE",
     "confidence": 0,
+    "matchMethod": "selector|exact_keyword|semantic_context|file_presence|calculation",
     "status": "success|needs_review|not_found",
     "reason": "结论理由"
   }
@@ -309,13 +321,16 @@ function validateFinalResult(indicator, result, context, observations) {
     value: String(result.value || ''),
     filePath: String(result.filePath || result.file_path || ''),
     matchedKeyword: String(result.matchedKeyword || result.matched_keyword || ''),
+    synonyms: Array.isArray(result.synonyms) ? result.synonyms.map(String).filter(Boolean) : [],
     keywordMeaning: String(result.keywordMeaning || result.keyword_meaning || ''),
     evidence: String(result.evidence || ''),
     dataTimestamp: String(result.dataTimestamp || result.data_timestamp || ''),
     fileMtime: String(result.fileMtime || result.file_mtime || ''),
     evidenceLevel: String(result.evidenceLevel || result.evidence_level || 'NONE').toUpperCase(),
     confidence: clampNumber(result.confidence, 0, 100, 0),
+    matchMethod: String(result.matchMethod || result.match_method || ''),
     status: String(result.status || 'not_found'),
+    sourceType: 'agent_collection',
     reason: String(result.reason || ''),
     observations: observations.slice(-5)
   };
@@ -327,19 +342,6 @@ function validateFinalResult(indicator, result, context, observations) {
   normalized.fileMtime = normalized.fileMtime || stat.mtime.toISOString();
   if (normalized.evidenceLevel === 'WEAK' || normalized.evidenceLevel === 'NONE') normalized.status = 'needs_review';
   return normalized;
-}
-
-function rememberResult(result, indicator, context) {
-  try {
-    saveAgentMemory({
-      memoryType: result.status === 'success' ? 'task_success' : 'dead_end', deviceType: context.deviceType,
-      vendor: context.vendor, model: context.model, indicatorId: indicator.indicatorId, indicatorName: indicator.indicator,
-      title: `${indicator.indicator}：${result.status}`, content: JSON.stringify({ value: result.value, filePath: stripDrive(result.filePath), matchedKeyword: result.matchedKeyword, meaning: result.keywordMeaning, reason: result.reason }),
-      sourceTaskId: context.taskId, evidence: result.evidence ? [{ filePath: stripDrive(result.filePath), content: result.evidence, fileMtime: result.fileMtime }] : [],
-      confidence: result.confidence,
-      status: result.status === 'success' || (result.status === 'not_found' && result.observations?.length) ? 'verified' : 'draft'
-    });
-  } catch {}
 }
 
 function compactResult(value, maxChars) {
@@ -374,7 +376,7 @@ function normalizeRoots(value) {
 }
 
 function emptyResult(indicator, status, reason) {
-  return { indicatorId: indicator.indicatorId, indicator: indicator.indicator, indicatorCode: indicator.indicatorCode, value: '', filePath: '', matchedKeyword: '', keywordMeaning: '', evidence: '', dataTimestamp: '', fileMtime: '', evidenceLevel: 'NONE', confidence: 0, status, reason };
+  return { indicatorId: indicator.indicatorId, indicator: indicator.indicator, indicatorCode: indicator.indicatorCode, value: '', filePath: '', matchedKeyword: '', synonyms: [], keywordMeaning: '', evidence: '', dataTimestamp: '', fileMtime: '', evidenceLevel: 'NONE', confidence: 0, matchMethod: '', status, sourceType: 'agent_collection', reason };
 }
 
 function isInsideRoots(filePath, roots) {

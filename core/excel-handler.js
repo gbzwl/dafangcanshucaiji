@@ -137,7 +137,7 @@ export function generateResultExcel(results, scanLog, outputPath) {
   const wb = XLSX.utils.book_new();
 
   // Sheet 1: 采集结果
-  const resultHeaders = ['序号', '指标', '采集值', '文件路径', '匹配关键字', '关键字和含义', '证据内容', '数据时间', '文件修改时间', '证据等级', '置信度', '状态'];
+  const resultHeaders = ['序号', '指标', '指标标识', '采集值', '文件路径', '匹配关键字', '备用关键字', '关键字和含义', '证据内容', '数据时间', '文件修改时间', '证据等级', '置信度', '匹配方式', '状态', '来源'];
   const resultData = [resultHeaders];
 
   let rowIndex = 1;
@@ -145,16 +145,20 @@ export function generateResultExcel(results, scanLog, outputPath) {
     resultData.push([
       rowIndex++,
       item.indicator || '',
+      item.indicatorCode || item.indicator_code || '',
       item.value || '-',
       item.file_path || item.filePath || '-',
       item.matchedKeyword || '-',
+      Array.isArray(item.synonyms) ? item.synonyms.join('; ') : (item.synonyms || ''),
       item.keywordMeaning || item.keyword_meaning || '-',
       item.match_line || item.evidence || item.line || '-',
       item.dataTimestamp || item.data_timestamp || '',
       item.fileMtime || item.file_mtime || '',
       item.evidenceLevel || item.evidence_level || 'NONE',
       item.confidence || 0,
-      item.status || (isSuccessfulResult(item) ? 'success' : 'not_found')
+      item.matchMethod || item.match_method || '',
+      item.status || (isSuccessfulResult(item) ? 'success' : 'not_found'),
+      item.sourceType || item.source_type || 'agent_collection'
     ]);
   }
 
@@ -162,8 +166,9 @@ export function generateResultExcel(results, scanLog, outputPath) {
 
   // 设置列宽
   wsResult['!cols'] = [
-    { wch: 8 }, { wch: 20 }, { wch: 18 }, { wch: 55 }, { wch: 24 },
-    { wch: 36 }, { wch: 70 }, { wch: 22 }, { wch: 22 }, { wch: 14 }, { wch: 12 }, { wch: 14 }
+    { wch: 8 }, { wch: 20 }, { wch: 28 }, { wch: 18 }, { wch: 55 }, { wch: 24 },
+    { wch: 28 }, { wch: 36 }, { wch: 70 }, { wch: 22 }, { wch: 22 }, { wch: 14 },
+    { wch: 12 }, { wch: 20 }, { wch: 14 }, { wch: 20 }
   ];
 
   // 表头样式

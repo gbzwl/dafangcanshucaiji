@@ -1,148 +1,162 @@
-/**
- * Electron 主进程 - MRI采集工具桌面应用入口
- */
-import { app, BrowserWindow, shell, dialog, Menu } from 'electron';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { spawn } from 'child_process';
+import { app, BrowserWindow, dialog, Menu, shell, utilityProcess } from 'electron';
+import fs from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const SERVER_PORT = Number(process.env.PORT || 9091);
+const isDev = !app.isPackaged;
 
 let mainWindow = null;
 let serverProcess = null;
-const SERVER_PORT = 9091;
+let shutdownStarted = false;
+let shutdownComplete = false;
+let serverExited = true;
 
-// 开发模式检测
-const isDev = !app.isPackaged;
+function log(message) {
+  try {
+    const logDir = app.getPath('userData');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.appendFileSync(path.join(logDir, 'app.log'), `${new Date().toISOString()} ${message}\n`);
+  } catch {
+    // Logging must never prevent the application from starting.
+  }
+}
+
+process.on('uncaughtException', error => log(`uncaughtException: ${error.stack || error.message}`));
+process.on('unhandledRejection', error => log(`unhandledRejection: ${error?.stack || error}`));
+log('main process loaded');
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1100,
-    height: 780,
+    width: 1180,
+    height: 820,
     minWidth: 900,
     minHeight: 600,
-    title: 'MRI设备日志参数采集工具',
-    icon: path.join(__dirname, 'assets', 'icon.ico'),
+    title: '大放设备参数采集工具',
+    autoHideMenuBar: true,
+    backgroundColor: '#f8fafc',
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true
-    },
-    // 窗口样式
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
-    autoHideMenuBar: true,
-    backgroundColor: '#F0F4F8',
-    show: false
+    }
   });
 
-  // 优雅显示窗口（避免白屏闪烁）
-  mainWindow.once('ready-to-show', () => {
-    mainWindow.show();
-  });
-
-  // 加载页面
-  if (isDev) {
-    mainWindow.loadURL(`http://localhost:${SERVER_PORT}`);
+  mainWindow.once('ready-to-show', () => mainWindow?.show());
+  mainWindow.loadURL(`http://127.0.0.1:${SERVER_PORT}`);
+  if (isDev && process.env.ELECTRON_DEVTOOLS === '1') {
     mainWindow.webContents.openDevTools({ mode: 'detach' });
-  } else {
-    mainWindow.loadURL(`http://localhost:${SERVER_PORT}`);
   }
 
-  // 外部链接在浏览器中打开
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: 'deny' };
   });
-
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
 }
 
-/**
- * 启动 Express 后端服务
- */
 function startServer() {
   const serverPath = path.join(__dirname, 'server.js');
-
-  serverProcess = spawn('node', [serverPath], {
+  const dataDir = isDev ? path.join(__dirname, 'temp') : app.getPath('userData');
+  serverProcess = utilityProcess.fork(serverPath, [], {
+    cwd: __dirname,
     env: {
       ...process.env,
       PORT: String(SERVER_PORT),
+      APP_DATA_DIR: dataDir,
       NODE_ENV: isDev ? 'development' : 'production'
     },
-    stdio: ['pipe', 'pipe', 'pipe', 'ipc']
+    stdio: 'pipe',
+    serviceName: 'Device Collector Server'
   });
+  serverExited = false;
+  serverProcess.on('spawn', () => log(`server process started: pid=${serverProcess.pid}, dataDir=${dataDir}`));
 
-  serverProcess.stdout?.on('data', (data) => {
-    console.log(`[Server] ${data.toString().trim()}`);
+  serverProcess.stdout?.on('data', data => console.log(`[Server] ${data.toString().trim()}`));
+  serverProcess.stderr?.on('data', data => console.error(`[Server] ${data.toString().trim()}`));
+  serverProcess.on('exit', code => {
+    serverExited = true;
+    log(`server process exited: code=${code}`);
+    serverProcess = null;
+    if (shutdownStarted || code === 0) return;
+    dialog.showErrorBox('服务异常', `后端服务已停止（退出码：${code ?? '未知'}）。`);
+    app.quit();
   });
+}
 
-  serverProcess.stderr?.on('data', (data) => {
-    console.error(`[Server Error] ${data.toString().trim()}`);
+function probeServer() {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const request = http.get(`http://127.0.0.1:${SERVER_PORT}/api/v1/health`, response => {
+      response.resume();
+      finish(response.statusCode === 200);
+    });
+    request.setTimeout(800, () => {
+      request.destroy();
+      finish(false);
+    });
+    request.on('error', () => finish(false));
   });
+}
 
-  serverProcess.on('error', (err) => {
-    console.error('启动服务失败:', err);
-    dialog.showErrorBox('启动失败', `后端服务启动失败: ${err.message}`);
-  });
+async function waitForServer(maxRetries = 60) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    if (await probeServer()) return;
+    if (!serverProcess || serverExited) throw new Error('后端服务进程已经退出');
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  throw new Error('后端服务启动超时');
+}
 
-  serverProcess.on('exit', (code) => {
-    console.log(`服务进程退出，代码: ${code}`);
-    if (code !== 0 && code !== null) {
-      dialog.showErrorBox('服务异常', '后端服务意外退出，应用将关闭。');
-      app.quit();
+function stopServer() {
+  return new Promise(resolve => {
+    const child = serverProcess;
+    if (!child || serverExited) {
+      resolve();
+      return;
     }
+
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      resolve();
+    };
+    child.once('exit', done);
+    child.postMessage({ type: 'shutdown' });
+    setTimeout(() => {
+      if (!serverExited) child.kill();
+      done();
+    }, 5000).unref();
   });
 }
 
-/**
- * 等待服务就绪
- */
-function waitForServer(maxRetries = 30) {
-  return new Promise((resolve, reject) => {
-    let retries = 0;
-
-    const check = () => {
-      const http = require('http');
-      const req = http.get(`http://localhost:${SERVER_PORT}/api/v1/health`, (res) => {
-        if (res.statusCode === 200) {
-          resolve();
-        } else {
-          retry();
-        }
-      });
-
-      req.on('error', retry);
-      req.setTimeout(1000, retry);
-    };
-
-    const retry = () => {
-      retries++;
-      if (retries >= maxRetries) {
-        reject(new Error('服务启动超时'));
-      } else {
-        setTimeout(check, 500);
-      }
-    };
-
-    check();
-  });
-}
-
-// ===== 应用生命周期 =====
-
-// macOS 默认应用菜单
 function setupMenu() {
-  const template = [
-    {
-      label: '文件',
-      submenu: [
-        { role: 'quit', label: '退出' }
-      ]
-    },
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { label: '文件', submenu: [{ role: 'quit', label: '退出' }] },
     {
       label: '编辑',
       submenu: [
@@ -165,67 +179,47 @@ function setupMenu() {
         { role: 'zoomIn', label: '放大' },
         { role: 'zoomOut', label: '缩小' }
       ]
-    },
-    {
-      label: '帮助',
-      submenu: [
-        {
-          label: '关于',
-          click: () => {
-            dialog.showMessageBox(mainWindow, {
-              type: 'info',
-              title: '关于',
-              message: 'MRI设备日志参数采集工具',
-              detail: `版本: 1.0.0\n平台: ${process.platform}\n架构: ${process.arch}\nElectron: ${process.versions.electron}\nNode.js: ${process.versions.node}`
-            });
-          }
-        }
-      ]
     }
-  ];
-
-  const menu = Menu.buildFromTemplate(template);
-  Menu.setApplicationMenu(menu);
+  ]));
 }
 
 app.whenReady().then(async () => {
+  log('electron ready');
   setupMenu();
-
-  // 启动后端服务
-  startServer();
-
-  try {
-    // 等待服务就绪
-    await waitForServer();
-    console.log('后端服务已就绪');
-  } catch (err) {
-    console.error('等待服务就绪失败:', err);
-    dialog.showErrorBox('启动失败', '后端服务未能在规定时间内就绪，请重试。');
+  if (await probeServer()) {
+    log(`port ${SERVER_PORT} is already in use`);
+    dialog.showErrorBox('无法启动', `端口 ${SERVER_PORT} 已有采集服务运行，请先将它关闭。`);
     app.quit();
     return;
   }
 
-  // 创建窗口
-  createWindow();
-
-  // macOS: 点击 dock 图标时重新创建窗口
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
-  });
-});
-
-// 所有窗口关闭时退出应用（macOS 除外）
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+  startServer();
+  try {
+    await waitForServer();
+    log('server ready, creating window');
+    createWindow();
+  } catch (error) {
+    log(`startup failed: ${error.stack || error.message}`);
+    dialog.showErrorBox('启动失败', error.message);
     app.quit();
   }
 });
 
-// 退出前清理
-app.on('before-quit', () => {
-  if (serverProcess) {
-    serverProcess.kill('SIGTERM');
-  }
+app.on('activate', () => {
+  if (!mainWindow && !shutdownStarted) createWindow();
+});
+
+app.on('window-all-closed', () => app.quit());
+
+app.on('before-quit', event => {
+  if (shutdownComplete) return;
+  event.preventDefault();
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  log('application shutdown started');
+  stopServer().finally(() => {
+    shutdownComplete = true;
+    log('application shutdown complete');
+    app.quit();
+  });
 });

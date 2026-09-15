@@ -55,6 +55,7 @@ async function generatedTool(context) {
 ${code}
 }
 try {
+  context.reportProgress = progress => process.stdout.write('\\n@@AGENT_PROGRESS@@' + JSON.stringify(progress || {}) + '\\n');
   const result = await generatedTool(context);
   process.stdout.write('@@AGENT_RESULT@@' + JSON.stringify({ success: true, result, durationMs: Date.now() - startedAt }));
 } catch (error) {
@@ -68,9 +69,11 @@ try {
 
   try {
     return await runNodeTool(scriptPath, inputPath, {
-      timeoutMs: clamp(context.timeoutMs, 1000, 5 * 60 * 1000, 60000),
+      idleTimeoutMs: clamp(context.idleTimeoutMs, 10000, 10 * 60 * 1000, 3 * 60 * 1000),
+      hardTimeoutMs: clamp(context.hardTimeoutMs, 60000, 30 * 60 * 1000, 15 * 60 * 1000),
       maxOutputChars: clamp(context.maxOutputChars, 1000, 100000, 30000),
-      signal: context.signal
+      signal: context.signal,
+      onProgress: context.onProgress
     });
   } finally {
     fs.rmSync(runDir, { recursive: true, force: true });
@@ -89,7 +92,8 @@ function runNodeTool(scriptPath, inputPath, options) {
     const finish = result => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimeout(idleTimer);
+      clearTimeout(hardTimer);
       options.signal?.removeEventListener('abort', abort);
       resolve(result);
     };
@@ -98,11 +102,23 @@ function runNodeTool(scriptPath, inputPath, options) {
       finish(failure(reason));
     };
     const abort = () => stop('生成工具执行已停止');
-    const timer = setTimeout(() => stop('生成工具执行超时'), options.timeoutMs);
+    let idleTimer;
+    const resetIdleTimer = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => stop('生成工具长时间没有报告扫描进度'), options.idleTimeoutMs);
+    };
+    resetIdleTimer();
+    const hardTimer = setTimeout(() => stop('生成工具达到单次执行安全上限'), options.hardTimeoutMs);
     options.signal?.addEventListener('abort', abort, { once: true });
 
     child.stdout.on('data', chunk => {
-      stdout += chunk.toString('utf8');
+      const text = chunk.toString('utf8');
+      const progressMatches = [...text.matchAll(/@@AGENT_PROGRESS@@([^\r\n]+)/g)];
+      for (const match of progressMatches) {
+        resetIdleTimer();
+        try { options.onProgress?.(JSON.parse(match[1])); } catch {}
+      }
+      stdout += text.replace(/@@AGENT_PROGRESS@@[^\r\n]+[\r\n]*/g, '');
       if (stdout.length > options.maxOutputChars) stop('生成工具输出超过限制');
     });
     child.stderr.on('data', chunk => {
